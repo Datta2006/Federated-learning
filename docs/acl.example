@@ -1,0 +1,36 @@
+# Federated PM2.5 broker ACL (strict pre-Stage-3 profile).
+# Copy to /tmp/fedpm25-mosquitto/acl and chmod 600.
+#
+# Each node may PUBLISH only under its own aq/<node_id>/# and READ the
+# federated global tree aq/fl/#. The server may read/write everything.
+
+user flserver
+topic readwrite #
+topic read $SYS/#
+
+user node1
+topic write aq/node1/#
+topic read aq/fl/#
+
+user node2
+topic write aq/node2/#
+topic read aq/fl/#
+
+user node3
+topic write aq/node3/#
+topic read aq/fl/#
+
+user node4
+topic write aq/node4/#
+topic read aq/fl/#
+
+user node5
+topic write aq/node5/#
+topic read aq/fl/#
+
+# ---------------------------------------------------------------------------
+# Stage 3 extension (uncomment under each node's user block when Stage 3 lands)
+# ---------------------------------------------------------------------------
+# topic write aq/fl/round/+/update/node1/#
+# topic read aq/node1/cmd
+# topic read aq/alerts/#

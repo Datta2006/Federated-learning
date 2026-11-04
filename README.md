@@ -1,6 +1,7 @@
 # Federated PM2.5 Forecasting on IoT Nodes
 
-College IoT project. **Stages 1 and 2 are implemented**:
+College IoT project. **Stages 1 and 2 are implemented, plus the pre-Stage-3
+improved model variant**:
 
 - **Stage 1:** real-data inspection, shared preprocessing, CNN-RNN model,
   centralized / local-only / persistence / PM2.5-only baselines, 3-seed
@@ -8,6 +9,9 @@ College IoT project. **Stages 1 and 2 are implemented**:
 - **Stage 2:** Mosquitto broker config, MQTT node hello-world with retained
   online status, retained LWT offline status, health heartbeats, and a small
   server-side status/health observer.
+- **Pre-Stage 3:** delta-target improved CNN-RNN (12 h / 24 h windows, no
+  pooling, hour sin/cos), a 6-hour-ahead comparison, a commented LAN broker
+  profile, and a two-node retained-status/LWT integration test.
 
 Federated averaging, dataset replay, predictions, dashboard, and phone/Termux
 nodes are later stages.
@@ -26,6 +30,10 @@ Project root: the `iot/` directory containing this README.
 - `baselines/` implements four real-data baselines:
   **persistence**, **centralized**, **local-only**, and the
   **PM2.5-only ablation**, all over seeds **42, 43, 44**.
+- `baselines/improved.py` adds the improved variant: **delta target**
+  (`y[t+h] - pm25[t]`), **12 h and 24 h windows**, **no pooling**
+  (`pool_size=1`), and **hour-of-day sin/cos** inputs, still over the same
+  seeds. It also reports a **6-hour-ahead** horizon against persistence.
 - `results.csv` reports mean ± std for both **raw unclipped** test targets and
   **clipped** test targets. The **headline is raw unclipped**.
 - Federated results are **not** present yet; they will be added later.
@@ -103,6 +111,20 @@ python -m baselines.pm25_only --verbose 2
 python -m baselines.local_only --verbose 0
 ```
 
+Run the improved variant suite (12 h and 24 h, local-only, and 6 h horizon).
+It upserts its rows into `results.csv` and regenerates `results.png`:
+
+```bash
+python -m baselines.improved --local-windows 12,24 --verbose 0
+```
+
+Smoke-test the improved plumbing without overwriting the reported results:
+
+```bash
+python -m baselines.improved --seeds 42 --windows 12 --skip-local --skip-horizon \
+  --epochs 1 --verbose 0 --no-write
+```
+
 ## Stage 1 results
 
 Seeds: `42, 43, 44`. Values are **mean ± standard deviation over seeds**.
@@ -143,6 +165,65 @@ hidden and is listed in the known issues.
 
 Per-node local-only results are in `baselines/local_only_per_node.csv`.
 
+## Improved variant results (pre-Stage 3)
+
+The paper-faithful model above does **not** beat persistence. The improved
+variant changes four things while keeping the same 3-seed protocol:
+
+- **Delta target:** the model predicts the scaled change
+  `y[t+h] - pm25[t]`, and the last observed hour is added back before inverse
+  Min-Max scaling. This makes the model start near persistence and learn a
+  correction instead of re-learning the current value.
+- **Longer window:** 12 h and 24 h instead of 3 h.
+- **No effective pooling:** `MaxPooling1D(pool_size=1)` is an identity pool,
+  so the RNN sees every hour instead of one pooled timestep.
+- **Hour-of-day features:** `sin(2*pi*hour/24)` and `cos(2*pi*hour/24)`
+  appended after the three scaled sensor features.
+
+These numbers come from
+`python -m baselines.improved --local-windows 12,24 --verbose 0` on the real
+Beijing data, seeds `42, 43, 44`. Headline raw unclipped targets:
+
+```text
+method                       RMSE              MAE               R2
+persistence_w12              24.938 ± 0.000    13.634 ± 0.000    0.9447 ± 0.0000
+centralized_improved_w12     23.912 ± 0.444    13.596 ± 0.594    0.9491 ± 0.0019
+centralized_improved_w24     23.726 ± 0.283    13.557 ± 0.547    0.9499 ± 0.0012
+local_only_improved_w12      24.971 ± 0.190    14.823 ± 0.210    0.9445 ± 0.0008
+local_only_improved_w24      25.576 ± 0.874    15.333 ± 1.089    0.9418 ± 0.0040
+```
+
+Secondary clipped targets:
+
+```text
+method                       RMSE              MAE               R2
+centralized_improved_w12     23.293 ± 0.422    13.307 ± 0.587    0.9507 ± 0.0018
+centralized_improved_w24     23.084 ± 0.253    13.273 ± 0.540    0.9516 ± 0.0011
+local_only_improved_w12      24.288 ± 0.153    14.534 ± 0.213    0.9464 ± 0.0007
+local_only_improved_w24      24.841 ± 0.790    15.040 ± 1.086    0.9439 ± 0.0036
+persistence_w12              25.272 ± 0.000    13.760 ± 0.000    0.9420 ± 0.0000
+```
+
+Six-hour-ahead horizon (raw unclipped), same first-80%/last-20% split:
+
+```text
+method                       RMSE              MAE               R2
+centralized_improved_w12_h6  67.041 ± 2.071    44.319 ± 1.317    0.5999 ± 0.0249
+persistence_w12_h6           77.418 ± 0.000    47.376 ± 0.000    0.4668 ± 0.0000
+```
+
+**Interpretation, stated plainly:** the 24 h improved variant beats
+persistence on all three raw headline metrics (RMSE 23.726 vs 24.938, MAE
+13.557 vs 13.634, R2 0.9499 vs 0.9447) and does so with lower seed variance
+than the 12 h variant. At 6 hours it is clearly better than persistence (RMSE
+67.04 vs 77.42, R2 0.600 vs 0.467). The improved **local-only** models clearly
+beat the old local-only model (28.495) but are still worse than persistence on RMSE
+(24.971 for 12 h, 25.576 for 24 h, vs 24.938). The 12 h local-only model is
+better than the 24 h one, while the centralized 24 h model is the best overall.
+That gap between local-only and centralized is exactly what federated averaging
+is meant to close. These are single-dataset Beijing results, not a general
+claim.
+
 ## Model size and federated update size
 
 The CNN-RNN has **8,769 trainable parameters**. At float32:
@@ -157,30 +238,80 @@ With 16 KiB chunks (`chunk_size=16384`), that is 3 chunks:
 additional and is not included in the 35 KB figure. The PM2.5-only ablation has
 **8,513 parameters ≈ 34 KB** raw.
 
+The improved variant has **9,025 trainable parameters** (five inputs, same
+Conv1D/RNN/Dense widths). At float32:
+
+```text
+9,025 parameters × 4 bytes = 36,100 bytes ≈ 35.25 KiB ≈ 36.1 KB
+```
+
+That is still **3 chunks** at 16 KiB: `16,384 + 16,384 + 3,332` bytes. The 12 h
+and 24 h variants have identical parameter counts and identical update size;
+only the input window length changes. This keeps a federated update in the
+"few chunks" range required for MQTT.
+
 ## Stage 2: MQTT hello-world
 
 ### Broker
 
-`docs/mosquitto.conf` is a local development broker config:
+`docs/mosquitto.conf` has two profiles:
 
-- listener on `127.0.0.1:1883` (loopback only for Stage 2; widening to
-  `0.0.0.0` for phone/LAN nodes requires enabling auth/ACL/TLS)
-- anonymous clients allowed **for local development only**
-- persistence enabled at `/tmp/fedpm25-mosquitto/`
-- commented username/password, ACL, and TLS examples
+- **Profile A (default, development):** `listener 1883 127.0.0.1`,
+  `allow_anonymous true`. Open to processes on this laptop only. Persistence
+  lives at `/tmp/fedpm25-mosquitto/`.
+- **Profile B (LAN, commented out):** `listener 1883 0.0.0.0`,
+  `allow_anonymous false`, `password_file`, `acl_file`. Enable it when phones
+  or virtual nodes connect over Wi-Fi. Keep Profile A for day-to-day dev.
 
-Run it from the project root:
+Run the default profile from the project root:
 
 ```bash
 mkdir -p /tmp/fedpm25-mosquitto
 mosquitto -c docs/mosquitto.conf -v
 ```
 
-On a normal machine the usual install is `brew install mosquitto`. On this
-macOS 12 machine Homebrew's build failed in its Python/Sphinx docs stage, so
-Mosquitto 2.0.20 was built from source with OpenSSL 3 and
-`WITH_WEBSOCKETS=OFF`, then installed as `/usr/local/bin/mosquitto` plus
-`mosquitto_pub` and `mosquitto_sub`.
+To enable the LAN profile, comment out Profile A's `listener` and
+`allow_anonymous` lines, uncomment Profile B, then create credentials:
+
+```bash
+mkdir -p /tmp/fedpm25-mosquitto
+mosquitto_passwd -c -b /tmp/fedpm25-mosquitto/passwd flserver '<server-password>'
+mosquitto_passwd -b /tmp/fedpm25-mosquitto/passwd node1 '<node1-password>'
+mosquitto_passwd -b /tmp/fedpm25-mosquitto/passwd node2 '<node2-password>'
+mosquitto_passwd -b /tmp/fedpm25-mosquitto/passwd node3 '<node3-password>'
+mosquitto_passwd -b /tmp/fedpm25-mosquitto/passwd node4 '<node4-password>'
+mosquitto_passwd -b /tmp/fedpm25-mosquitto/passwd node5 '<node5-password>'
+chmod 600 /tmp/fedpm25-mosquitto/passwd
+```
+
+The exact ACL is committed as `docs/acl.example`. Each node may publish only
+under its own `aq/<node_id>/#` and read `aq/fl/#`; the server may read/write
+everything:
+
+```bash
+cp docs/acl.example /tmp/fedpm25-mosquitto/acl
+chmod 600 /tmp/fedpm25-mosquitto/acl
+```
+
+Then point clients at the laptop's LAN IP:
+
+```bash
+ipconfig getifaddr en0
+python -m node.node_client --node-id node1 --host 192.168.1.50 --verbose
+```
+
+**Stage 3 ACL conflict, stated explicitly:** Stage 3 nodes publish updates on
+`aq/fl/round/{r}/update/{node}/...`, which is outside `aq/<node_id>/#`. The
+strict ACL above blocks that. `docs/mosquitto.conf` documents the extra
+`topic write aq/fl/round/+/update/node1/#` lines (and `topic read aq/node1/cmd`,
+`topic read aq/alerts/#`) to add when Stage 3 lands. Do not silently widen the
+ACL before then.
+
+On this machine `mosquitto`, `mosquitto_pub`, and `mosquitto_sub` are installed
+at `/usr/local/bin`. **`mosquitto_passwd` is not installed** (the source build
+did not install it), so the LAN commands above need it built/installed from the
+Mosquitto source tree first. The default anonymous loopback profile does not
+need it.
 
 ### Server status observer
 
@@ -242,6 +373,25 @@ Stage 2 verified online retained status, retained LWT offline, and graceful
 offline on this machine. Health fields are `null` in Stage 2 because no sensor
 backend exists yet; no fake readings are published.
 
+### Two-node independence test
+
+`tests/test_two_nodes_integration.py` starts a throwaway Mosquitto broker on a
+free localhost port, runs the real `node.node_client` as `node1` and `node2`,
+`SIGKILL`s node1, and asserts that node1's retained status becomes
+`offline reason=lwt` while node2 remains `online`. It then `SIGKILL`s node2 and
+asserts both retained statuses are independently `offline reason=lwt`. It skips
+automatically if `mosquitto` is not installed.
+
+```bash
+python -m pytest -q tests/test_two_nodes_integration.py -s
+```
+
+Real output on this machine:
+
+```text
+1 passed in 8.64s
+```
+
 ### Topic contract
 
 ```text
@@ -249,6 +399,9 @@ aq/<node_id>/status      retained; online/offline; LWT uses offline
 aq/<node_id>/health      QoS 1; heartbeat; not retained
 aq/<node_id>/prediction  reserved for a later stage
 aq/<node_id>/data/<k>    reserved for chunked data/weights
+aq/<node_id>/cmd         reserved for set_interval/ring/force_sync commands
+aq/alerts/<zone>         reserved for retained AQI alerts
+aq/fl/...                reserved for Stage 3 global model and round traffic
 aq/server/...            reserved for server commands/rounds
 ```
 
@@ -259,17 +412,20 @@ python -m pytest -q
 ruff check common baselines tests node server
 ```
 
-Current result: **24 passed**, lint clean. Coverage includes:
+Current result on this machine: **31 passed**, lint clean. The two-node test
+skips if `mosquitto` is not installed. Coverage includes:
 
 - Magnus-formula relative humidity and physical clipping
 - PM2.5 forward-fill/interpolate/clip behaviour
 - raw-vs-clipped target handling and no scaler leakage from test outliers
 - sliding-window shapes, values, and target indices
 - Min-Max scale/inverse round trip
+- delta/horizon window alignment, cyclic-hour features, and delta reconstruction
 - chunk splitting, out-of-order reassembly, SHA-256, duplicates, missing chunks
 - RMSE/MAE/R2, raw/clipped target scoring, mean/std aggregation
 - stale per-seed rows are replaced when a method is rerun
 - MQTT topic construction and JSON message/LWT payload helpers
+- two real nodes with independent retained status and independent LWT
 
 ## Methodology notes
 
@@ -283,8 +439,13 @@ Current result: **24 passed**, lint clean. Coverage includes:
 - Raw unclipped targets use the same fill/interpolate step but skip the p99.5
   clip. They still contain no NaNs.
 - Min-Max bounds are shared by every node through `common/config.json`.
-- Model: `Conv1D(64) -> MaxPool -> Flatten -> reshape -> SimpleRNN(64,
-  dropout=0.2) -> Dense(1)`, Adam lr 0.001, early stopping on validation loss.
+- Paper-faithful model: `Conv1D(64) -> MaxPool -> Flatten -> reshape ->
+  SimpleRNN(64, dropout=0.2) -> Dense(1)`, Adam lr 0.001, early stopping on
+  validation loss.
+- Improved model: same widths with `pool_size=1`, 12 h or 24 h windows, hour
+  sin/cos appended, and a delta target in scaled space. The target index for
+  horizon `h` is `i + window - 1 + h`; `h=1` is the next-hour task and `h=6`
+  is the 6-hour-ahead task.
 - Negative predictions are clipped to zero before computing metrics.
 - Persistence uses the raw current-hour PM2.5 as its single prediction vector
   for both raw and clipped targets, matching how the learned models are scored.
@@ -297,10 +458,18 @@ Current result: **24 passed**, lint clean. Coverage includes:
 
 - No federated averaging, dataset replay, prediction publishing, dashboard, or
   phone backend yet. Those are later stages.
-- The CNN-RNN does **not** beat persistence on the current data/architecture.
-  The likely causes are the very short 3-hour window, `MaxPool(2)` compressing
-  it to one timestep for the RNN, and strong hour-to-hour autocorrelation.
-  This should be addressed before claiming model superiority.
+- The **paper-faithful** CNN-RNN does **not** beat persistence. The improved
+  variant (delta target, 24 h window, no pooling, hour sin/cos) does:
+  RMSE 23.726 vs 24.938 and R2 0.9499 vs 0.9447 over 3 seeds. The main fix is
+  the delta target, which makes the model learn a correction to persistence
+  instead of re-learning the current value.
+- The improved local-only model is still slightly worse than persistence on
+  RMSE (24.971 vs 24.938), so federation has room to improve it. This is the
+  motivation for Stage 4, not a claimed result.
+- `mosquitto_passwd` is missing from this machine's source build, so the LAN
+  password-file commands in `docs/mosquitto.conf` require installing it first.
+- The strict LAN ACL (node publishes only under `aq/<node_id>/#`) will block
+  Stage 3 update topics until the documented Stage 3 lines are uncommented.
 - TensorFlow import takes ~45 seconds on the current Intel macOS machine.
 - TensorFlow 2.16.2 is the available macOS x86 package for Python 3.12.
 - Seeded training is deterministic where TensorFlow permits; timing varies with

@@ -324,7 +324,20 @@ def plot_results(config: dict[str, Any]) -> Path:
         raise FileNotFoundError(f"no results to plot: {results_path}")
 
     frame = pd.read_csv(results_path)
-    order = ["centralized", "local_only", "pm25_only", "persistence"]
+    order = [
+        "persistence",
+        "persistence_w12",
+        "persistence_w24",
+        "persistence_w12_h6",
+        "centralized",
+        "centralized_improved_w12",
+        "centralized_improved_w24",
+        "centralized_improved_w12_h6",
+        "local_only",
+        "local_only_improved_w12",
+        "local_only_improved_w24",
+        "pm25_only",
+    ]
     frame["_order"] = frame["method"].map(
         {name: index for index, name in enumerate(order)}
     ).fillna(len(order))
@@ -378,7 +391,8 @@ def plot_results(config: dict[str, Any]) -> Path:
 
     axes[0].legend(loc="upper right", fontsize=8)
     fig.suptitle(
-        "Beijing PM2.5 next-hour baselines: mean over 3 seeds, error bars = std"
+        "Beijing PM2.5 baselines: next-hour and 6-hour horizon, "
+        "mean over 3 seeds, error bars = std"
     )
     fig.tight_layout()
     plot_path.parent.mkdir(parents=True, exist_ok=True)

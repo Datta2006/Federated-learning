@@ -78,7 +78,7 @@ def derive_relative_humidity(
     return humidity
 
 
-def _fill_pm25_series(values: pd.Series) -> pd.Series:
+def fill_pm25_series(values: pd.Series) -> pd.Series:
     """Forward-fill first, then interpolate any remaining (leading) gaps."""
     series = values.astype(float).copy().ffill()
     series = series.interpolate(method="linear", limit_direction="both")
@@ -89,7 +89,7 @@ def _fill_pm25_series(values: pd.Series) -> pd.Series:
 
 def clean_pm25_series(values: pd.Series, clip_p995: float) -> pd.Series:
     """Forward-fill, linearly interpolate, then clip PM2.5 at a percentile."""
-    series = _fill_pm25_series(values)
+    series = fill_pm25_series(values)
     return series.clip(lower=0.0, upper=float(clip_p995))
 
 
@@ -167,7 +167,7 @@ def compute_global_scaler(
         train_rows = max(1, int(len(year_frame) * train_fraction))
         if train_rows >= len(year_frame):
             raise ValueError(f"year {year} is too short for a train/test split")
-        filled = _fill_pm25_series(year_frame["pm2.5"].iloc[:train_rows])
+        filled = fill_pm25_series(year_frame["pm2.5"].iloc[:train_rows])
         filled_train_parts.append(filled.to_numpy(dtype=float))
 
     clip_p995 = float(
@@ -222,8 +222,8 @@ def prepare_node_windows(
     train_frame = node_frame.iloc[:split_row].copy()
     test_frame = node_frame.iloc[split_row:].copy()
     clip_value = float(scaler["pm25_clip"])
-    train_frame["pm25_raw"] = _fill_pm25_series(train_frame["pm2.5"])
-    test_frame["pm25_raw"] = _fill_pm25_series(test_frame["pm2.5"])
+    train_frame["pm25_raw"] = fill_pm25_series(train_frame["pm2.5"])
+    test_frame["pm25_raw"] = fill_pm25_series(test_frame["pm2.5"])
     train_frame["pm25"] = clean_pm25_series(train_frame["pm2.5"], clip_value)
     test_frame["pm25"] = clean_pm25_series(test_frame["pm2.5"], clip_value)
     node_frame = pd.concat([train_frame, test_frame]).sort_index()
