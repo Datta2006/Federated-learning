@@ -1,0 +1,8 @@
+# Laptop/server environment (Python 3.12 recommended; TensorFlow is not for Termux)
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.5.2
+matplotlib==3.9.4
+paho-mqtt==2.1.0
+tensorflow==2.16.2
+pytest==8.4.2

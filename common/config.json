@@ -1,0 +1,80 @@
+{
+  "clip_quantile": 0.995,
+  "dataset_path": "data/beijing_pm25.csv",
+  "features": [
+    "pm25",
+    "temp",
+    "rh"
+  ],
+  "federated": {
+    "deadline_sec": 120,
+    "local_epochs": 1,
+    "min_clients": 3,
+    "rounds": 5
+  },
+  "model": {
+    "batch_size": 64,
+    "conv_filters": 64,
+    "dropout": 0.2,
+    "kernel_size": 2,
+    "learning_rate": 0.001,
+    "max_epochs": 40,
+    "patience": 8,
+    "pool_size": 2,
+    "rnn_units": 64
+  },
+  "mqtt": {
+    "base_topic": "aq",
+    "chunk_size": 16384,
+    "heartbeat_sec": 10,
+    "host": "127.0.0.1",
+    "keepalive": 60,
+    "port": 1883,
+    "qos": 1
+  },
+  "nodes": {
+    "node1": 2010,
+    "node2": 2011,
+    "node3": 2012,
+    "node4": 2013,
+    "node5": 2014
+  },
+  "paths": {
+    "model_dir": "server/model_registry",
+    "results_csv": "results.csv",
+    "results_plot": "results.png"
+  },
+  "project": "fedpm25",
+  "scaler": {
+    "feature_max": [
+      463.7099999999991,
+      42.0,
+      100.0
+    ],
+    "feature_min": [
+      0.0,
+      -19.0,
+      2.6887970468780704
+    ],
+    "pm25_clip": 463.7099999999991,
+    "trained_rows": 35059,
+    "trained_years": [
+      2010,
+      2011,
+      2012,
+      2013,
+      2014
+    ]
+  },
+  "schema_version": 1,
+  "seed": 42,
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "target": "pm25",
+  "train_fraction": 0.8,
+  "val_fraction_of_train": 0.1,
+  "window_hours": 3
+}
