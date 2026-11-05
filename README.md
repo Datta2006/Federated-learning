@@ -1,7 +1,7 @@
 # Federated PM2.5 Forecasting on IoT Nodes
 
-College IoT project. **Stages 1 and 2 are implemented, plus the pre-Stage-3
-improved model variant**:
+College IoT project. **Stages 1, 2, and 3 are implemented**, plus the
+pre-Stage-3 improved model variant:
 
 - **Stage 1:** real-data inspection, shared preprocessing, CNN-RNN model,
   centralized / local-only / persistence / PM2.5-only baselines, 3-seed
@@ -9,12 +9,23 @@ improved model variant**:
 - **Stage 2:** Mosquitto broker config, MQTT node hello-world with retained
   online status, retained LWT offline status, health heartbeats, and a small
   server-side status/health observer.
+- **Stage 3:** chunked model-weight exchange over MQTT. Float32 weights are
+  sent as 16 KiB sequenced chunks with per-chunk and whole-payload SHA-256,
+  JSON metadata (`schema_version`, `node_id`, `ts`), out-of-order/duplicate/
+  corrupted/missing handling, server acknowledgements, `.npy` + JSON receipts,
+  a prediction-preservation check, and a retained global-model announce.
 - **Pre-Stage 3:** delta-target improved CNN-RNN (12 h / 24 h windows, no
   pooling, hour sin/cos), a 6-hour-ahead comparison, a commented LAN broker
   profile, and a two-node retained-status/LWT integration test.
 
 Federated averaging, dataset replay, predictions, dashboard, and phone/Termux
-nodes are later stages.
+inference are later stages. The live federated topology is **four training
+nodes (`node1`–`node4`) plus one inference-only node (`node5`, the phone)**.
+The phone does not train, does not upload weights, and its code must not import
+TensorFlow; it may only publish status, health, and predictions. The server
+enforces this through `federated.training_nodes` and
+`federated.inference_only_nodes` in `common/config.json`. The Stage 1 baselines
+still use all five data years; the role split applies to live MQTT uploads.
 
 Project root: the `iot/` directory containing this README.
 
@@ -64,8 +75,10 @@ The three model inputs are `[pm25, temp, rh]`.
 
 ## Setup (laptop only)
 
-TensorFlow is **not** installed or required on Termux. Use a laptop Python 3.12
-environment for Stage 1.
+The project requires **Python 3.10+** and **paho-mqtt 2.x**. TensorFlow is
+**not** installed or required on Termux. Stages 1 and 3 training/weight-building
+run on the laptop; Termux code must stay inference-only and must not import
+TensorFlow. Use a laptop Python 3.12 environment for Stage 1 and the demos.
 
 ```bash
 python3.12 -m venv .venv
@@ -73,6 +86,9 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
+
+Always use the project virtual environment (`source .venv/bin/activate`); do
+not install packages globally.
 
 Build the shared scaler in `common/config.json` once (and again after changing
 the dataset or split settings):
@@ -254,7 +270,7 @@ only the input window length changes. This keeps a federated update in the
 
 ### Broker
 
-`docs/mosquitto.conf` has two profiles:
+`docs/mosquitto.conf` has three profiles:
 
 - **Profile A (default, development):** `listener 1883 127.0.0.1`,
   `allow_anonymous true`. Open to processes on this laptop only. Persistence
@@ -262,6 +278,11 @@ only the input window length changes. This keeps a federated update in the
 - **Profile B (LAN, commented out):** `listener 1883 0.0.0.0`,
   `allow_anonymous false`, `password_file`, `acl_file`. Enable it when phones
   or virtual nodes connect over Wi-Fi. Keep Profile A for day-to-day dev.
+- **Profile C (LAN demo only, commented out):** `listener 1883 0.0.0.0`,
+  `allow_anonymous true`, **no ACL**. This is for a private hotspot or a
+  trusted Wi-Fi network during a classroom demo. Every device on that network
+  can read and forge federated traffic; never use it on public Wi-Fi or the
+  internet.
 
 Run the default profile from the project root:
 
@@ -284,9 +305,10 @@ mosquitto_passwd -b /tmp/fedpm25-mosquitto/passwd node5 '<node5-password>'
 chmod 600 /tmp/fedpm25-mosquitto/passwd
 ```
 
-The exact ACL is committed as `docs/acl.example`. Each node may publish only
-under its own `aq/<node_id>/#` and read `aq/fl/#`; the server may read/write
-everything:
+The exact ACL is committed as `docs/acl.example`. Each training node may
+publish under its own `aq/<node_id>/#` and its own Stage 3 update subtree
+`aq/fl/round/+/update/<node_id>/#`, and read `aq/fl/#`; the server may
+read/write everything. The inference-only node has no weight-write permission:
 
 ```bash
 cp docs/acl.example /tmp/fedpm25-mosquitto/acl
@@ -300,12 +322,30 @@ ipconfig getifaddr en0
 python -m node.node_client --node-id node1 --host 192.168.1.50 --verbose
 ```
 
-**Stage 3 ACL conflict, stated explicitly:** Stage 3 nodes publish updates on
-`aq/fl/round/{r}/update/{node}/...`, which is outside `aq/<node_id>/#`. The
-strict ACL above blocks that. `docs/mosquitto.conf` documents the extra
-`topic write aq/fl/round/+/update/node1/#` lines (and `topic read aq/node1/cmd`,
-`topic read aq/alerts/#`) to add when Stage 3 lands. Do not silently widen the
-ACL before then.
+**Stage 3 ACL is already included:** each node publishes its update on
+`aq/fl/round/{r}/update/{node}/...`, outside `aq/<node_id>/#`. The committed
+`docs/acl.example` therefore gives every node both its own tree and its own
+update subtree:
+
+```text
+topic write aq/node1/#
+topic write aq/fl/round/+/update/node1/#
+topic read aq/fl/#
+```
+
+`topic read aq/fl/#` covers the round ack and the retained global announce.
+The `cmd` and `alerts` read lines stay commented until those stages land. The
+server already has `topic readwrite #`, so it needs no extra line.
+
+To use **Profile C** for a demo, comment out Profile A's two lines, uncomment
+the Profile C block in `docs/mosquitto.conf`, and point every client at the
+laptop's LAN IP:
+
+```bash
+ipconfig getifaddr en0
+mosquitto -c docs/mosquitto.conf -v
+python -m node.weight_sender --node-id node1 --host 192.168.1.50 --wait-ack
+```
 
 On this machine `mosquitto`, `mosquitto_pub`, and `mosquitto_sub` are installed
 at `/usr/local/bin`. **`mosquitto_passwd` is not installed** (the source build
@@ -395,15 +435,227 @@ Real output on this machine:
 ### Topic contract
 
 ```text
-aq/<node_id>/status      retained; online/offline; LWT uses offline
-aq/<node_id>/health      QoS 1; heartbeat; not retained
-aq/<node_id>/prediction  reserved for a later stage
-aq/<node_id>/data/<k>    reserved for chunked data/weights
-aq/<node_id>/cmd         reserved for set_interval/ring/force_sync commands
-aq/alerts/<zone>         reserved for retained AQI alerts
-aq/fl/...                reserved for Stage 3 global model and round traffic
-aq/server/...            reserved for server commands/rounds
+aq/<node_id>/status                     retained; online/offline; LWT uses offline
+aq/<node_id>/health                     QoS 1; heartbeat; not retained
+aq/<node_id>/prediction                 inference-only node output (later stage)
+aq/<node_id>/cmd                        reserved for set_interval/ring/force_sync
+aq/alerts/<zone>                        reserved for retained AQI alerts
+aq/fl/global/announce                   retained; global model metadata (flserver)
+aq/fl/global/chunk/<i>                  QoS 1; global model chunk i; not retained
+aq/fl/round/<r>/update/<node>/meta      QoS 1; round update metadata
+aq/fl/round/<r>/update/<node>/chunk/<i> QoS 1; round update chunk i
+aq/fl/round/<r>/ack/<node>              QoS 1; server acknowledgement
+aq/server/...                           reserved for server commands/rounds
 ```
+
+## Stage 3: chunked weight exchange over MQTT
+
+### What was built
+
+Stage 3 sends one float32 weight vector from a node to the server (or from the
+server to the fleet) over MQTT. It is deliberately **transport-agnostic** at the
+core: `common/weight_transfer.py` owns the envelope, validation, chunking, and
+receiver state machine; `node/weight_sender.py` and `server/weight_receiver.py`
+are paho-mqtt CLI adapters. The sender also offers an optional
+`--train-epochs` plumbing path for the real-weight demo. The same core is used
+by the unit tests.
+
+Each transfer is:
+
+1. **Metadata** (`update_meta` for a round, `announce` for the global model)
+   with `schema_version`, `node_id`, `ts` (UTC ISO-8601), `model_version`,
+   whole-payload `sha256`, `size`, `chunks`, `chunk_size`, `dtype`, `count`,
+   `kind`, the model architecture needed to rebuild it, and an optional
+   prediction fingerprint.
+2. **Sequenced chunks** (`chunk`) with `index`, `chunks`, `size`,
+   `chunk_sha256`, and base64 `data`. Default size is **16 KiB**, so the
+   improved 9,025-parameter model is **36,100 bytes → 3 chunks**.
+3. **A server ack** for round updates with `status` (`accepted`/`rejected`),
+   `reason`, `missing`, and `predictions_match`.
+
+Every JSON object carries `schema_version`, `node_id`, and `ts`, and all
+messages use QoS 1. Global mode uses `node_id=flserver`; update acks also use
+`node_id=flserver` with `target_node` set to the sender.
+
+### Privacy contract
+
+Only model weights, checksums, model metadata, and prediction fingerprints
+leave a node. **Raw PM2.5, temperature, and humidity readings never enter the
+Stage 3 payloads.** The receiver accepts weight uploads only from
+`federated.training_nodes`. An inference-only node or unknown node ID gets an
+explicit `rejected` ack and is never saved, so the phone cannot impersonate a
+training node.
+
+### Run the demos
+
+Start the broker in terminal 1:
+
+```bash
+mkdir -p /tmp/fedpm25-mosquitto
+mosquitto -c docs/mosquitto.conf -v
+```
+
+Start the receiver in terminal 2. **It must be running before the sender**:
+chunks are not retained, so a late receiver misses them (the global announce is
+the only retained Stage 3 message).
+
+```bash
+source .venv/bin/activate
+python -m server.weight_receiver --mode update --verbose
+```
+
+Run the dummy-array plumbing test in terminal 3 (no TensorFlow, so this is the
+fast path):
+
+```bash
+python -m node.weight_sender --node-id node1 --round 1 --dummy --wait-ack --verbose
+```
+
+Real output on this machine (sender):
+
+```text
+publishing mode=update node_id=node1 round=1 model_version=dummy-v1 kind=dummy size=36100 chunks=3 chunk_size=16384 sha256=fd8be11577cd2473e7b8931811465eb10c69bcf16cb178682c6c0757ef3663a1
+all chunks published
+ack accepted sha256=fd8be11577cd2473e7b8931811465eb10c69bcf16cb178682c6c0757ef3663a1 chunks_received=3 predictions_match=None
+```
+
+Receiver:
+
+```text
+subscribed aq/fl/round/+/update/+/meta, aq/fl/round/+/update/+/chunk/+
+metadata round=1 node=node1 model_version=dummy-v1 size=36100 chunks=3 sha256=fd8be11577cd2473e7b8931811465eb10c69bcf16cb178682c6c0757ef3663a1
+accepted round=1 node=node1 model_version=dummy-v1 size=36100 chunks=3 sha256=fd8be11577cd2473e7b8931811465eb10c69bcf16cb178682c6c0757ef3663a1 predictions_match=None saved=/private/tmp/fedpm25-demo/registry/round_1_node1.npy
+ack accepted round=1 node=node1 reason=None
+```
+
+#### Real improved 24 h Keras weights
+
+The default real mode builds the improved 24 h architecture with the configured
+seed. This transfers real Keras weights and checks that the receiver's
+predictions are unchanged:
+
+```bash
+python -m node.weight_sender --node-id node1 --round 1 --wait-ack --verbose
+```
+
+Sender and receiver output:
+
+```text
+publishing mode=update node_id=node1 round=1 model_version=improved_w24_seed42 kind=model size=36100 chunks=3 chunk_size=16384 sha256=3c6295097c4b7fbdd59aeaf6460fc7b98111b67fb555f723cf3222496319994b
+all chunks published
+ack accepted sha256=3c6295097c4b7fbdd59aeaf6460fc7b98111b67fb555f723cf3222496319994b chunks_received=3 predictions_match=True
+
+prediction check sample_match=True digest_match=True
+accepted round=1 node=node1 model_version=improved_w24_seed42 size=36100 chunks=3 sha256=3c6295097c4b7fbdd59aeaf6460fc7b98111b67fb555f723cf3222496319994b predictions_match=True saved=/private/tmp/fedpm25-demo-real/registry/round_1_node1.npy
+```
+
+Train one epoch on the node's own windows before sending (this is a plumbing
+check, not a claimed federated result):
+
+```bash
+python -m node.weight_sender --node-id node1 --round 1 --train-epochs 1 --wait-ack --verbose
+```
+
+```text
+trained node1 for 1 epoch(s) on 6286 windows
+publishing mode=update node_id=node1 round=1 model_version=improved_w24_seed42 kind=model size=36100 chunks=3 chunk_size=16384 sha256=ddf7d91f5784bb9e8aac4ffa77d28bbc00e9b29837bafb6345ffe0ec21d05ce1
+all chunks published
+ack accepted sha256=ddf7d91f5784bb9e8aac4ffa77d28bbc00e9b29837bafb6345ffe0ec21d05ce1 chunks_received=3 predictions_match=True
+```
+
+#### Global model announce
+
+Global mode publishes a retained announce plus non-retained chunks under
+`aq/fl/global/...`. There is no ack in this direction. Start the receiver in
+global mode before the sender:
+
+```bash
+python -m server.weight_receiver --mode global --verbose
+python -m node.weight_sender --mode global --verbose
+```
+
+```text
+publishing mode=global node_id=flserver round=- model_version=improved_w24_seed42 kind=model size=36100 chunks=3 chunk_size=16384 sha256=3c6295097c4b7fbdd59aeaf6460fc7b98111b67fb555f723cf3222496319994b
+all chunks published
+
+metadata round=None node=flserver model_version=improved_w24_seed42 size=36100 chunks=3 sha256=3c6295097c4b7fbdd59aeaf6460fc7b98111b67fb555f723cf3222496319994b
+prediction check sample_match=True digest_match=True
+accepted round=None node=flserver model_version=improved_w24_seed42 size=36100 chunks=3 sha256=3c6295097c4b7fbdd59aeaf6460fc7b98111b67fb555f723cf3222496319994b predictions_match=True saved=/private/tmp/fedpm25-demo-global2/registry/global_improved_w24_seed42.npy
+```
+
+The retained announce is the only Stage 3 message a late subscriber receives:
+
+```json
+{"schema_version":1,"node_id":"flserver","ts":"2026-11-05T09:51:12.386Z","message_type":"announce","model_version":"improved_w24_seed42","sha256":"3c6295097c4b7fbdd59aeaf6460fc7b98111b67fb555f723cf3222496319994b","size":36100,"chunks":3,...}
+```
+
+### Failure handling demos
+
+Both hooks are test-only flags on the sender. Corrupt one chunk **after** its
+SHA-256 is computed, so the receiver sees a real checksum mismatch:
+
+```bash
+python -m node.weight_sender --node-id node1 --round 1 --dummy --wait-ack --corrupt-chunk 1
+```
+
+```text
+ack rejected reason=chunk checksum mismatch at index 1: expected e5b53a268d169bf0e0fd1a432d0c897d9b77aa7936e13e1278788029879f626c, got 468da76698bd4d12aa850ae1cfbb88dbb5a1996185071258e838e85e1ebc3dd0 missing=[1, 2]
+```
+
+Drop a chunk and let the receiver's missing timeout fire:
+
+```bash
+python -m node.weight_sender --node-id node1 --round 1 --dummy --wait-ack --drop-chunk 1
+```
+
+```text
+ack rejected reason=missing chunks: [1] missing=[1]
+```
+
+Both rejections exit **2**, send a `rejected` ack, and save nothing. The
+receiver also rejects:
+
+- a conflicting duplicate chunk (an identical QoS 1 duplicate is tolerated),
+- a chunk whose topic index disagrees with its payload index,
+- a chunk count / size / dtype inconsistency in metadata,
+- an update from an unknown node or from the inference-only node, with an
+  explicit `rejected` ack,
+- a whole-payload SHA-256 mismatch at `finalize`,
+- a rebuilt model whose probe predictions differ from the metadata fingerprint.
+
+### Receiver state machine
+
+`WeightReceiver` accepts chunks **out of order** and keeps one in-flight
+transfer per `(round, node)` (or one global transfer). It records identical
+duplicates as `duplicates_ignored`, marks the transfer failed on any
+conflicting or malformed chunk, and `finalize()` joins the payload, checks the
+whole-transfer SHA-256, and decodes float32. For `kind="model"` the receiver
+rebuilds the same Keras architecture, loads the received weights, runs a
+deterministic synthetic probe, and compares the first eight predictions plus
+their SHA-256. That proves the weights survived the round trip; it is not a
+test-set accuracy evaluation.
+
+Accepted transfers are written as `<stem>.npy` (no pickle) plus a JSON receipt
+containing metadata, chunk counts, duplicate count, prediction result, and a
+UTC timestamp. Default location is `server/model_registry/`; override with
+`--out-dir`.
+
+### Stage 3 files
+
+- `common/weight_transfer.py` — pure transfer seam: metadata, chunk messages,
+  SHA-256, topic builders/parsers, `WeightReceiver`, ack builder, prediction
+  fingerprint, dummy weights.
+- `node/weight_sender.py` — CLI sender for update and global modes; dummy,
+  seeded real, and one-epoch trained weights; ack wait; corrupt/drop test hooks.
+- `server/weight_receiver.py` — CLI receiver for update and global modes;
+  validation, reassembly, prediction check, `.npy`/JSON save, ack.
+- `tests/test_weight_transfer.py` — 18 unit tests, including a real improved
+  24 h Keras round trip with unchanged predictions.
+- `tests/test_weight_transfer_mqtt.py` — 4 real-broker integration tests:
+  accepted round trip, corrupted chunk rejected, missing chunk rejected, and an
+  inference-only node update rejected with an ack.
+- `tests/broker_utils.py` — shared throwaway-Mosquitto helpers, also used by
+  the Stage 2 two-node test.
 
 ## Tests
 
@@ -412,8 +664,9 @@ python -m pytest -q
 ruff check common baselines tests node server
 ```
 
-Current result on this machine: **31 passed**, lint clean. The two-node test
-skips if `mosquitto` is not installed. Coverage includes:
+Current result on this machine: **53 passed**, lint clean. The two-node test
+and the four Stage 3 broker tests skip if `mosquitto` is not installed. The
+real-weight test needs TensorFlow. Coverage includes:
 
 - Magnus-formula relative humidity and physical clipping
 - PM2.5 forward-fill/interpolate/clip behaviour
@@ -422,6 +675,20 @@ skips if `mosquitto` is not installed. Coverage includes:
 - Min-Max scale/inverse round trip
 - delta/horizon window alignment, cyclic-hour features, and delta reconstruction
 - chunk splitting, out-of-order reassembly, SHA-256, duplicates, missing chunks
+- float32 encode/decode round trip and exact weight preservation
+- metadata validation: header, UTC timestamp, size/count/dtype, chunk count,
+  round rules
+- four-training-node / one-inference-only role split and sender refusal of an
+  inference-only upload
+- Stage 3 topic builders/parsers and JSON-safe chunk sequencing
+- ack content without raw sensor readings
+- receiver tolerance of identical QoS 1 duplicates and rejection of conflicts
+- per-chunk SHA-256, whole-payload SHA-256, topic/payload index disagreement,
+  and out-of-range chunk indexes
+- real improved 24 h Keras weights round trip with unchanged predictions
+- real-broker sender → receiver → ack, corrupted-chunk rejection,
+  missing-chunk timeout, and inference-only rejection, each asserting that
+  rejected transfers save nothing
 - RMSE/MAE/R2, raw/clipped target scoring, mean/std aggregation
 - stale per-seed rows are replaced when a method is rerun
 - MQTT topic construction and JSON message/LWT payload helpers
@@ -430,7 +697,10 @@ skips if `mosquitto` is not installed. Coverage includes:
 ## Methodology notes
 
 - Node mapping: `node1=2010`, `node2=2011`, `node3=2012`, `node4=2013`,
-  `node5=2014`.
+  `node5=2014`. This five-year mapping is the Stage 1 data mapping used by the
+  baselines. In the live MQTT topology, `node1`–`node4` are training nodes and
+  `node5` is the inference-only phone (`federated.training_nodes` and
+  `federated.inference_only_nodes`).
 - Each node uses the first 80% of its year's rows for train/validation and the
   last 20% for test. The scaler and 99.5th-percentile clip value are fitted on
   training rows only, so test values do not leak into scaling.
@@ -453,11 +723,44 @@ skips if `mosquitto` is not installed. Coverage includes:
   slice and then predictions are pooled for the headline metrics.
 - Seed handling: centralized and PM2.5-only use the seed directly; local-only
   uses `seed + node_index` for its five models.
+- Stage 3 transports contiguous little-endian float32 weights in JSON base64
+  chunks of 16 KiB. The 16 KiB limit applies to the raw chunk before base64 and
+  JSON overhead. Chunk count is `ceil(size / chunk_size)`; the last chunk is
+  shorter and its exact length is checked.
+- Stage 3 uses the existing `common/chunking.py` assembler and the existing
+  `common/model.py` flatten/unflatten helpers. Topic builders and parsers live
+  in `common/weight_transfer.py` so the sender, receiver, and tests share one
+  contract.
 
 ## Known issues / current limits
 
-- No federated averaging, dataset replay, prediction publishing, dashboard, or
-  phone backend yet. Those are later stages.
+- Stage 3 **transfers** weights; it does **not** average them yet. Federated
+  averaging, dataset replay, prediction publishing, the dashboard, and the
+  phone backend are later stages.
+- Stage 3 chunks are **not retained**. Only the global announce is retained, so
+  the receiver must be running before a node sends a round update. A receiver
+  that starts late sees the retained global announce and then rejects it for
+  missing chunks. There is no resume-after-reconnect or application-level
+  retransmission; the sender must resend the whole transfer.
+- The receiver keeps accepted weights and receipts on disk, but in-flight
+  transfers are memory-only and one-per-`(round, node)`. A restart loses
+  partial progress.
+- The prediction check is a deterministic synthetic probe compared on the first
+  eight values plus a SHA-256 digest. It proves exact weight transport, not
+  test-set accuracy, and it does not use raw node readings.
+- Stage 3 has no message signing. It relies on the broker's password file and
+  ACL (Profile B). Profile C is anonymous and demo-only, so anyone on the same
+  trusted network can publish forged updates.
+- There is no TLS listener enabled; the commented TLS block is an example.
+- The phone/Termux client is still a later stage and must remain
+  **inference-only** (`node5` in the live topology). It must not train or upload
+  weights, and its code must not import TensorFlow. The sender refuses to
+  upload from `node5`, and the receiver rejects any such update with an explicit
+  ack; the broker ACL also omits `node5`'s update-write line.
+- `mosquitto_passwd` is missing from this machine's source build, so the LAN
+  password-file commands in `docs/mosquitto.conf` require installing it first.
+  Profile C avoids it for demos; `docs/acl.example` already contains the Stage 3
+  update-write lines for Profile B.
 - The **paper-faithful** CNN-RNN does **not** beat persistence. The improved
   variant (delta target, 24 h window, no pooling, hour sin/cos) does:
   RMSE 23.726 vs 24.938 and R2 0.9499 vs 0.9447 over 3 seeds. The main fix is
@@ -466,14 +769,11 @@ skips if `mosquitto` is not installed. Coverage includes:
 - The improved local-only model is still slightly worse than persistence on
   RMSE (24.971 vs 24.938), so federation has room to improve it. This is the
   motivation for Stage 4, not a claimed result.
-- `mosquitto_passwd` is missing from this machine's source build, so the LAN
-  password-file commands in `docs/mosquitto.conf` require installing it first.
-- The strict LAN ACL (node publishes only under `aq/<node_id>/#`) will block
-  Stage 3 update topics until the documented Stage 3 lines are uncommented.
 - TensorFlow import takes ~45 seconds on the current Intel macOS machine.
 - TensorFlow 2.16.2 is the available macOS x86 package for Python 3.12.
 - Seeded training is deterministic where TensorFlow permits; timing varies with
   machine load. Metrics were stable enough across 3 seeds to report mean ± std.
-- The broker config allows anonymous access for local development only. The
-  commented ACL/TLS blocks in `docs/mosquitto.conf` are examples, not enabled.
+- Profile A allows anonymous access on loopback only. Profile C allows anonymous
+  access on the LAN for trusted-network demos only. Neither is an internet
+  deployment profile.
 - Stage 2 health payloads intentionally contain `null` sensor fields.

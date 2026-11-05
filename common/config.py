@@ -36,3 +36,30 @@ def resolve_path(path: str | Path) -> Path:
     if candidate.is_absolute():
         return candidate
     return (PROJECT_ROOT / candidate).resolve()
+
+
+def _node_id_set(value: Any, field: str) -> set[str]:
+    if not isinstance(value, list) or not all(
+        isinstance(node_id, str) and node_id for node_id in value
+    ):
+        raise ValueError(f"{field} must be a list of non-empty node IDs")
+    return set(value)
+
+
+def training_node_ids(config: dict[str, Any]) -> set[str]:
+    """Node IDs allowed to upload Stage 3 weight updates.
+
+    Falls back to every ``nodes`` entry when ``federated.training_nodes`` is
+    absent, so older config files keep working.
+    """
+    federated = config.get("federated", {})
+    configured = federated.get("training_nodes")
+    if configured is None:
+        return set(config.get("nodes", {}))
+    return _node_id_set(configured, "federated.training_nodes")
+
+
+def inference_only_node_ids(config: dict[str, Any]) -> set[str]:
+    """Node IDs that may publish status/health/predictions but never weights."""
+    configured = config.get("federated", {}).get("inference_only_nodes", [])
+    return _node_id_set(configured, "federated.inference_only_nodes")

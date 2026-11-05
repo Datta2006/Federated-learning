@@ -13,14 +13,10 @@ from typing import Any
 import paho.mqtt.client as mqtt
 
 from common.config import load_config
-from common.mqtt_utils import create_client, loads
+from common.mqtt_utils import create_client, loads, reason_code_value
 
 LOGGER = logging.getLogger(__name__)
 STOP = threading.Event()
-
-
-def _reason_code_value(reason_code: Any) -> int:
-    return int(getattr(reason_code, "value", reason_code))
 
 
 def _node_from_topic(topic: str, base_topic: str) -> str | None:
@@ -60,7 +56,7 @@ def run(
         properties: Any = None,
     ) -> None:
         del userdata, flags, properties
-        code = _reason_code_value(reason_code)
+        code = reason_code_value(reason_code)
         if code != 0:
             LOGGER.error("connect failed: %s", reason_code)
             return

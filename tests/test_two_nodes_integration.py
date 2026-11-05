@@ -14,12 +14,10 @@ import json
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
 import uuid
-from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -28,46 +26,12 @@ paho = pytest.importorskip("paho.mqtt.client")
 import paho.mqtt.client as mqtt
 
 from common.config import PROJECT_ROOT
+from tests.broker_utils import free_port, start_broker
 
 MOSQUITTO = shutil.which("mosquitto")
 pytestmark = pytest.mark.skipif(
     MOSQUITTO is None, reason="mosquitto binary is not installed"
 )
-
-
-def _free_port() -> int:
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _wait_for_port(port: int, timeout: float = 10.0) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with closing(socket.create_connection(("127.0.0.1", port), timeout=0.2)):
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise AssertionError(f"broker did not listen on port {port}")
-
-
-def _start_broker(tmp_path: Path, port: int) -> subprocess.Popen:
-    config = tmp_path / "mosquitto.conf"
-    config.write_text(
-        f"listener {port} 127.0.0.1\n"
-        "allow_anonymous true\n"
-        "persistence false\n"
-        "log_dest none\n",
-        encoding="utf-8",
-    )
-    process = subprocess.Popen(
-        [MOSQUITTO, "-c", str(config)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    _wait_for_port(port)
-    return process
 
 
 def _node_config(tmp_path: Path, port: int) -> Path:
@@ -158,8 +122,8 @@ def _wait_for_status(port: int, predicate, timeout: float = 12.0) -> dict[str, d
 
 
 def test_two_nodes_have_independent_retained_status_and_lwt(tmp_path):
-    port = _free_port()
-    broker = _start_broker(tmp_path, port)
+    port = free_port()
+    broker = start_broker(tmp_path, port)
     config = _node_config(tmp_path, port)
     node1 = node2 = None
     try:

@@ -23,14 +23,11 @@ from common.mqtt_utils import (
     make_message,
     node_topic,
     publish_json,
+    reason_code_value,
 )
 
 LOGGER = logging.getLogger(__name__)
 STOP = threading.Event()
-
-
-def _reason_code_value(reason_code: Any) -> int:
-    return int(getattr(reason_code, "value", reason_code))
 
 
 def make_status(node_id: str, state: str, reason: str | None = None) -> dict[str, Any]:
@@ -120,7 +117,7 @@ def run(
         properties: Any = None,
     ) -> None:
         del userdata, flags, properties
-        code = _reason_code_value(reason_code)
+        code = reason_code_value(reason_code)
         if code != 0:
             LOGGER.error("connect failed: %s", reason_code)
             return
@@ -143,7 +140,7 @@ def run(
     def on_disconnect(client: mqtt.Client, userdata: Any, *args: Any) -> None:
         del client, userdata
         reason_code = args[1] if len(args) >= 2 else (args[0] if args else None)
-        code = _reason_code_value(reason_code) if reason_code is not None else None
+        code = reason_code_value(reason_code) if reason_code is not None else None
         if code == 0:
             LOGGER.info("disconnected cleanly")
         else:

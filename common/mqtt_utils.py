@@ -27,6 +27,11 @@ def utc_now_iso() -> str:
     )
 
 
+def reason_code_value(reason_code: Any) -> int:
+    """Return the integer code from a paho v1 or v2 reason code."""
+    return int(getattr(reason_code, "value", reason_code))
+
+
 def create_client(
     client_id: str,
     host: str,

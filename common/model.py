@@ -64,6 +64,21 @@ def build_model(
     return model
 
 
+def build_model_from_config(model_config: dict[str, Any]) -> tf.keras.Model:
+    """Build a model from the Stage 3 metadata ``model`` object."""
+    return build_model(
+        window_hours=int(model_config["window_hours"]),
+        n_features=int(model_config["n_features"]),
+        conv_filters=int(model_config.get("conv_filters", 64)),
+        kernel_size=int(model_config.get("kernel_size", 2)),
+        pool_size=int(model_config.get("pool_size", 1)),
+        rnn_units=int(model_config.get("rnn_units", 64)),
+        dropout=float(model_config.get("dropout", 0.2)),
+        learning_rate=float(model_config.get("learning_rate", 0.001)),
+        seed=int(model_config.get("seed", 42)),
+    )
+
+
 def make_callbacks(patience: int, verbose: int = 0) -> list[tf.keras.callbacks.Callback]:
     """Early stopping; restore the best validation weights."""
     return [
