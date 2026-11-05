@@ -329,13 +329,17 @@ def plot_results(config: dict[str, Any]) -> Path:
         "persistence_w12",
         "persistence_w24",
         "persistence_w12_h6",
+        "persistence_w24_4nodes",
         "centralized",
         "centralized_improved_w12",
         "centralized_improved_w24",
         "centralized_improved_w12_h6",
+        "centralized_improved_w24_4nodes",
         "local_only",
         "local_only_improved_w12",
         "local_only_improved_w24",
+        "local_only_improved_w24_4nodes",
+        "federated_improved_w24",
         "pm25_only",
     ]
     frame["_order"] = frame["method"].map(

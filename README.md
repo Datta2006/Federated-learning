@@ -1,6 +1,6 @@
 # Federated PM2.5 Forecasting on IoT Nodes
 
-College IoT project. **Stages 1, 2, and 3 are implemented**, plus the
+College IoT project. **Stages 1, 2, 3, and 4 are implemented**, plus the
 pre-Stage-3 improved model variant:
 
 - **Stage 1:** real-data inspection, shared preprocessing, CNN-RNN model,
@@ -14,18 +14,25 @@ pre-Stage-3 improved model variant:
   JSON metadata (`schema_version`, `node_id`, `ts`), out-of-order/duplicate/
   corrupted/missing handling, server acknowledgements, `.npy` + JSON receipts,
   a prediction-preservation check, and a retained global-model announce.
+- **Stage 4:** FedAvg over MQTT for four training nodes plus one inference-only
+  node. The server runs a dependency DAG per round, validates every update,
+  averages by `n_samples`, keeps a versioned model registry, and tracks the
+  best evaluated checkpoint by weighted validation loss. Nodes are long-lived
+  and evaluate each incoming global model on their own validation split; final
+  test metrics come from a separate offline scorer.
 - **Pre-Stage 3:** delta-target improved CNN-RNN (12 h / 24 h windows, no
   pooling, hour sin/cos), a 6-hour-ahead comparison, a commented LAN broker
   profile, and a two-node retained-status/LWT integration test.
 
-Federated averaging, dataset replay, predictions, dashboard, and phone/Termux
+Dataset replay, prediction publishing, the dashboard, and phone/Termux
 inference are later stages. The live federated topology is **four training
 nodes (`node1`–`node4`) plus one inference-only node (`node5`, the phone)**.
 The phone does not train, does not upload weights, and its code must not import
 TensorFlow; it may only publish status, health, and predictions. The server
 enforces this through `federated.training_nodes` and
 `federated.inference_only_nodes` in `common/config.json`. The Stage 1 baselines
-still use all five data years; the role split applies to live MQTT uploads.
+still use all five data years; the Stage 4 comparison uses node1-node4 and
+scores node5 separately as unseen data.
 
 Project root: the `iot/` directory containing this README.
 
@@ -657,16 +664,206 @@ UTC timestamp. Default location is `server/model_registry/`; override with
 - `tests/broker_utils.py` — shared throwaway-Mosquitto helpers, also used by
   the Stage 2 two-node test.
 
+## Stage 4: FedAvg over MQTT
+
+### What was built
+
+| File | Role |
+| --- | --- |
+| `common/federated.py` | Pure rules: weighted `fedavg`, weighted validation loss, version names, update metadata/weight validation. No MQTT or TensorFlow. |
+| `common/model_delivery.py` | Retained global-model publisher and version-aware late-joiner receiver. |
+| `server/dag_runner.py` | Generic task DAG: dependency order, retries, per-task timeouts, failure propagation, cycle detection. |
+| `server/fl_coordinator.py` | Server round DAG, online detection, update collection, ack/reject, FedAvg, versioned registry, `rounds.csv`. |
+| `node/fl_node.py` | Long-lived node: imports TensorFlow once, waits for invitations, evaluates, trains, uploads, repeats. |
+| `server/offline_eval.py` | Separate final scorer over each node's last-20% test slice. |
+| `experiments/stage4_experiment.py` | Fair four-node baselines, federated seeds, offline scoring, `results.csv`/`results.png`/`stage4_summary.json`. |
+| `common/broker.py` | Throwaway loopback Mosquitto helper shared by tests and the experiment. |
+
+The server round DAG is:
+
+```text
+check_online_nodes -> select_clients -> broadcast_global_model
+-> wait_for_updates -> validate_updates -> fedavg_aggregate
+-> register_model -> announce
+```
+
+The node DAG is `receive_model -> evaluate -> local_train -> upload`.
+
+### Round contract
+
+- A round starts only when at least `federated.min_clients` training nodes are
+  online (default 3 of 4). Online state comes from retained `aq/<node>/status`
+  plus the server's receive time; offline or slow nodes are dropped and the
+  round continues.
+- The server publishes the current global model, then
+  `aq/fl/round/{r}/start` with round id, `model_version`, `local_epochs`,
+  `learning_rate`, selected nodes, `min_clients`, and `deadline_ts`.
+- Nodes train locally and upload chunks under
+  `aq/fl/round/{r}/update/{node}/...`. Each update carries `round`, `node_id`,
+  `n_samples`, `n_val`, `val_loss`, chunk count, and SHA-256 checksums.
+- The server rejects an update with an explicit ack when the sender is
+  inference-only or not a training node, the round id is wrong, the checksum
+  does not match, weights contain NaN/Infinity, the weight count differs from
+  the global model, or the norm is abnormal. Accepted updates are acknowledged
+  immediately.
+- `fedavg` weights each node by its `n_samples`. The aggregated model is
+  registered as `v{r:04d}`; `latest.json` follows the newest version.
+- Nodes evaluate the model they **received** (version `v{r-1}`), not the model
+  produced by the round. The server attributes `weighted_val_loss` to that
+  evaluated version, updates its registry record, and moves `best.json` only
+  when a finite validation loss is lower.
+- Every round appends one row and one summary line to
+  `server/model_registry/rounds.csv`:
+  `round, selected, received, dropped_nodes, bytes_up, bytes_down,
+  round_time_sec, weighted_val_loss, evaluated_version, model_version`.
+
+No payload contains raw readings. The server never holds raw node data; it only
+receives weights and scalar validation summaries.
+
+### Late joiners
+
+The chosen mechanism is **retained chunks carrying `model_version`** plus a
+retained announce. Mosquitto retains the latest message on each global-model
+chunk topic, so a node that starts after the model was published still receives
+every chunk. `GlobalModelReceiver` buffers chunks that arrive before the
+announce, assembles only the announced version, and ignores chunks from stale
+versions. This avoids any server-side subscriber handshake and survives a
+broker restart or a late inference-only node. Tested by
+`tests/test_model_delivery.py` (including a real broker and a late subscriber).
+
+### Run the live topology
+
+Terminal 1 — broker (Profile A, loopback):
+
+```bash
+mkdir -p /tmp/fedpm25-mosquitto
+mosquitto -c docs/mosquitto.conf -v
+```
+
+Terminals 2–6 — the four training nodes and the inference-only node. Start the
+nodes first so their retained status is available, or give the server a startup
+wait:
+
+```bash
+source .venv/bin/activate
+python -m node.fl_node --node-id node1
+python -m node.fl_node --node-id node2
+python -m node.fl_node --node-id node3
+python -m node.fl_node --node-id node4
+python -m node.fl_node --node-id node5 --inference-only
+```
+
+Terminal 7 — server:
+
+```bash
+source .venv/bin/activate
+python -m server.fl_coordinator \
+  --rounds 5 --local-epochs 1 --deadline-sec 120 \
+  --min-clients 3 --startup-wait-sec 120
+```
+
+Host and port come from `common/config.json` or `--host`/`--port`; nothing is
+hardcoded. Stop the nodes and server with Ctrl-C; both disconnect cleanly.
+
+Score the final registered model offline:
+
+```bash
+python -m server.offline_eval --verbose          # latest.json (recommended)
+python -m server.offline_eval --best --verbose   # best validation checkpoint
+```
+
+The default is `latest.json`, because the final round's model has seen every
+aggregation but has not itself been evaluated. `--best` loads `best.json`, the
+evaluated version with the lowest weighted validation loss.
+
+### Reproduce the fair comparison
+
+```bash
+# Fair four-node baselines: 15 epochs for compute parity with 15 local epochs
+python -m experiments.stage4_experiment --mode baselines \
+  --seeds 42,43,44 --rounds 15 --local-epochs 1
+
+# Federated: private loopback broker, 15 rounds, seeds 42/43/44
+python -m experiments.stage4_experiment --mode federated \
+  --seeds 42,43,44 --rounds 15 --local-epochs 1 \
+  --deadline-sec 240 --startup-timeout 600
+```
+
+### Results on this machine
+
+All rows are pooled node1-node4 test slices (`n_test=7,013`,
+`n_train=25,161`), mean ± std over seeds 42/43/44. Headline is raw unclipped.
+
+| Method | Epochs | RMSE raw | MAE raw | R² raw |
+| --- | ---: | ---: | ---: | ---: |
+| Persistence (24 h) | 0 | 25.2435 | 13.8794 | 0.9429 |
+| Centralized improved 24 h, 4 nodes | 12.67 | 24.9862 ± 0.5810 | 14.5723 ± 0.5125 | 0.9440 ± 0.0026 |
+| Local-only improved 24 h, 4 nodes | 12.58 | 25.9442 ± 0.8332 | 15.4061 ± 0.9813 | 0.9396 ± 0.0039 |
+| **FedAvg improved 24 h** | **15.00** | **24.2709 ± 0.1279** | **13.6546 ± 0.0813** | **0.9472 ± 0.0006** |
+
+Clipped-target secondary metrics for the federated model: RMSE
+23.5001 ± 0.1934, MAE 13.3172 ± 0.0990, R² 0.9492 ± 0.0008.
+
+Unseen node5 (2014, never trained or scored into the pooled headline),
+`n_test=1,752`:
+
+| RMSE raw | MAE raw | R² raw |
+| ---: | ---: | ---: |
+| 22.3849 ± 0.1970 | 12.3869 ± 0.1182 | 0.9568 ± 0.0008 |
+
+Per-seed federated results (15/15 rounds completed, 4/4 updates every round):
+
+| Seed | Latest | Best (val loss) | RMSE raw | MAE raw | R² raw | Mean round time |
+| ---: | --- | --- | ---: | ---: | ---: | ---: |
+| 42 | v0015 | v0013 (0.001757) | 24.3946 | 13.7470 | 0.9466 | 5.40 s |
+| 43 | v0015 | v0014 (0.001729) | 24.1392 | 13.5945 | 0.9477 | 5.96 s |
+| 44 | v0015 | v0014 (0.001762) | 24.2788 | 13.6222 | 0.9471 | 7.64 s |
+
+Federated beats centralized, local-only, and persistence on all three pooled raw
+metrics in this fair four-node comparison. The margin over centralized (0.72
+RMSE) is close to centralized's seed std (0.58), so treat the gain as modest
+rather than decisive. The improved delta target is what makes the learned models
+competitive with persistence.
+
+### Bytes per round vs raw training data
+
+| Quantity | Bytes |
+| --- | ---: |
+| One float32 weight vector (9,025 params) | 36,100 |
+| Chunks at 16 KiB | 3 |
+| Mean wire bytes up per round (4 nodes) | 198,376.7 |
+| Mean wire bytes down per round (global model + acks + start) | 100,554.8 |
+| Mean wire bytes total per round | 298,931.5 |
+| Raw windowed training tensors (node1-node4) | 13,418,400 |
+| Raw feature rows (rough, 3 features × float32) | 335,736 |
+
+Fifteen rounds move about **4.48 MB** total (298,931.5 × 15), versus
+**13.42 MB** for a single copy of the raw windowed tensors. The server stores no
+raw data.
+
+### Stage 4 files
+
+- `common/federated.py`, `common/model_delivery.py`, `common/broker.py`
+- `server/dag_runner.py`, `server/fl_coordinator.py`, `server/offline_eval.py`
+- `node/fl_node.py`
+- `experiments/stage4_experiment.py`
+- `tests/test_federated.py`, `tests/test_dag_runner.py`,
+  `tests/test_model_delivery.py`, `tests/test_fl_integration.py`,
+  `tests/test_offline_eval.py`
+- Generated: `stage4_summary.json`, updated `results.csv`,
+  `results_by_seed.csv`, `results.png`; per-seed registries and logs under the
+  gitignored `.stage4_runs/`.
+
 ## Tests
 
 ```bash
 python -m pytest -q
-ruff check common baselines tests node server
+ruff check common baselines tests node server experiments
 ```
 
-Current result on this machine: **53 passed**, lint clean. The two-node test
-and the four Stage 3 broker tests skip if `mosquitto` is not installed. The
-real-weight test needs TensorFlow. Coverage includes:
+Current result on this machine: **79 passed**, lint clean. The broker-backed
+tests skip if `mosquitto` is not installed. The real-weight test needs
+TensorFlow. Coverage includes:
 
 - Magnus-formula relative humidity and physical clipping
 - PM2.5 forward-fill/interpolate/clip behaviour
@@ -693,6 +890,22 @@ real-weight test needs TensorFlow. Coverage includes:
 - stale per-seed rows are replaced when a method is rerun
 - MQTT topic construction and JSON message/LWT payload helpers
 - two real nodes with independent retained status and independent LWT
+- FedAvg hand-computed on tiny unequal `n_samples`
+- update validation rejects NaN/Infinity, bad checksum, wrong round id,
+  inference-only sender, non-training sender, weight-count mismatch, and an
+  abnormal weight norm
+- DAG topological ordering, retries, per-task timeout, failure propagation, and
+  cycle detection
+- retained global-model delivery to a late subscriber, stale-version rejection,
+  and buffering chunks that arrive before the announce
+- end-to-end three-node dummy round on a throwaway broker, including
+  hand-computed weighted FedAvg, `rounds.csv`, registry, acks, and a scan of
+  every topic/payload for raw-reading fields
+- a four-training-node + one-inference-only round where node4 is killed after
+  the round starts; the round still completes with three updates and node5
+  never uploads
+- offline registry selection (`latest` vs `best` vs explicit version) and
+  pooled test-slice scoring
 
 ## Methodology notes
 
@@ -734,29 +947,40 @@ real-weight test needs TensorFlow. Coverage includes:
 
 ## Known issues / current limits
 
-- Stage 3 **transfers** weights; it does **not** average them yet. Federated
-  averaging, dataset replay, prediction publishing, the dashboard, and the
-  phone backend are later stages.
-- Stage 3 chunks are **not retained**. Only the global announce is retained, so
-  the receiver must be running before a node sends a round update. A receiver
-  that starts late sees the retained global announce and then rejects it for
-  missing chunks. There is no resume-after-reconnect or application-level
-  retransmission; the sender must resend the whole transfer.
+- Stage 4 **averages** weights, but the final registered model (`latest.json`)
+  has not itself been evaluated: nodes always evaluate the model they received.
+  Use `best.json`/`--best` if you want the lowest validation-loss checkpoint.
+  The headline in this README scores `latest.json`.
+- Stage 4 validation-based selection uses each node's own validation split, not
+  the test split. Test metrics come only from the separate offline scorer, so
+  the test data never influences checkpoint selection.
+- Stage 4 is simulated on one laptop: five node processes plus the server share
+  one CPU and one TensorFlow install. Startup can take 60-90 seconds because
+  TensorFlow import alone takes ~45 seconds; round time is 5-8 seconds.
+- The Stage 4 inference-only `node.fl_node --inference-only` process is a
+  laptop simulation and still imports TensorFlow. The phone/Termux client is a
+  separate, later process and must not import TensorFlow.
+- Stage 3 update chunks are **not retained**. Only the global announce and the
+  Stage 4 global-model chunks are retained, so a receiver must be running before
+  a node sends a round update. A receiver that starts late sees the retained
+  global announce and then rejects it for missing chunks. There is no
+  resume-after-reconnect or application-level retransmission for updates; the
+  sender must resend the whole transfer.
 - The receiver keeps accepted weights and receipts on disk, but in-flight
   transfers are memory-only and one-per-`(round, node)`. A restart loses
   partial progress.
 - The prediction check is a deterministic synthetic probe compared on the first
   eight values plus a SHA-256 digest. It proves exact weight transport, not
   test-set accuracy, and it does not use raw node readings.
-- Stage 3 has no message signing. It relies on the broker's password file and
+- Stage 3/4 has no message signing. It relies on the broker's password file and
   ACL (Profile B). Profile C is anonymous and demo-only, so anyone on the same
   trusted network can publish forged updates.
 - There is no TLS listener enabled; the commented TLS block is an example.
 - The phone/Termux client is still a later stage and must remain
   **inference-only** (`node5` in the live topology). It must not train or upload
-  weights, and its code must not import TensorFlow. The sender refuses to
-  upload from `node5`, and the receiver rejects any such update with an explicit
-  ack; the broker ACL also omits `node5`'s update-write line.
+  weights, and its code must not import TensorFlow. The server rejects any
+  update from `node5` with an explicit ack; the broker ACL also omits `node5`'s
+  update-write line.
 - `mosquitto_passwd` is missing from this machine's source build, so the LAN
   password-file commands in `docs/mosquitto.conf` require installing it first.
   Profile C avoids it for demos; `docs/acl.example` already contains the Stage 3
@@ -766,9 +990,11 @@ real-weight test needs TensorFlow. Coverage includes:
   RMSE 23.726 vs 24.938 and R2 0.9499 vs 0.9447 over 3 seeds. The main fix is
   the delta target, which makes the model learn a correction to persistence
   instead of re-learning the current value.
-- The improved local-only model is still slightly worse than persistence on
-  RMSE (24.971 vs 24.938), so federation has room to improve it. This is the
-  motivation for Stage 4, not a claimed result.
+- Federated 24 h wins the fair four-node comparison on pooled raw RMSE, MAE,
+  and R², but the margin over centralized (0.72 RMSE) is close to centralized's
+  seed std (0.58). With three seeds this is a modest, not decisive, gain. The
+  federated run also uses more total local epochs (15) than centralized
+  (12.67 ± early stopping), so compute is matched by budget, not by wall time.
 - TensorFlow import takes ~45 seconds on the current Intel macOS machine.
 - TensorFlow 2.16.2 is the available macOS x86 package for Python 3.12.
 - Seeded training is deterministic where TensorFlow permits; timing varies with

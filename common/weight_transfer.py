@@ -564,6 +564,21 @@ def round_ack_topic(base_topic: str, round_number: int, node_id: str) -> str:
     return fl_topic(base_topic, "fl", "round", str(round_number), "ack", node_id)
 
 
+def round_ack_filter(base_topic: str, node_id: str) -> str:
+    """Wildcard filter for every ack addressed to one node."""
+    _require_safe_token(node_id, "node_id")
+    return fl_topic(base_topic, "fl", "round") + f"/+/ack/{node_id}"
+
+
+def round_start_topic(base_topic: str, round_number: int) -> str:
+    round_number = _require_positive_int(round_number, "round_number")
+    return fl_topic(base_topic, "fl", "round", str(round_number), "start")
+
+
+def round_start_filter(base_topic: str) -> str:
+    return fl_topic(base_topic, "fl", "round") + "/+/start"
+
+
 def parse_global_chunk_topic(topic: str, base_topic: str) -> int | None:
     """Return the chunk index from ``aq/fl/global/chunk/{i}``, or None."""
     pattern = re.compile(

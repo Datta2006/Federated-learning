@@ -94,6 +94,7 @@ def run_centralized_improved(
     verbose: int = 1,
     seed: int | None = None,
     method: str | None = None,
+    node_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Train one improved model on all nodes and score pooled test predictions."""
     config, raw = _load(config_path)
@@ -104,6 +105,7 @@ def run_centralized_improved(
         horizon=horizon,
         delta=delta,
         cyclic_hour=cyclic_hour,
+        node_ids=node_ids,
     )
     run_seed = int(seed if seed is not None else config["seed"])
     set_seed(run_seed)
@@ -169,6 +171,7 @@ def run_local_only_improved(
     verbose: int = 1,
     seed: int | None = None,
     method: str | None = None,
+    node_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Train one improved model per node, sharing nothing, and pool predictions."""
     config, raw = _load(config_path)
@@ -179,6 +182,7 @@ def run_local_only_improved(
         horizon=horizon,
         delta=delta,
         cyclic_hour=cyclic_hour,
+        node_ids=node_ids,
     )
     base_seed = int(seed if seed is not None else config["seed"])
     method_name = method or (
@@ -251,6 +255,7 @@ def run_persistence_improved(
     horizon: int = 1,
     seed: int | None = None,
     method: str | None = None,
+    node_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Persistence on the exact same test windows as the improved model."""
     config, raw = _load(config_path)
@@ -261,6 +266,7 @@ def run_persistence_improved(
         horizon=horizon,
         delta=False,
         cyclic_hour=False,
+        node_ids=node_ids,
     )
     run_seed = int(seed if seed is not None else config["seed"])
     prediction = _concat(prepared, "current_test_pm25_raw")

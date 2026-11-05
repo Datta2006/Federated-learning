@@ -1,0 +1,183 @@
+{
+  "aggregate": {
+    "created_utc": "2026-11-05T12:08:24Z",
+    "epochs_mean": 15.0,
+    "headline": "raw_unclipped",
+    "mae_clipped_mean": 13.317174042186357,
+    "mae_clipped_std": 0.09899638548169547,
+    "mae_raw_mean": 13.654595519800756,
+    "mae_raw_std": 0.08125012568016493,
+    "method": "federated_improved_w24",
+    "n_seeds": 3,
+    "n_test": 7013,
+    "n_train": 25161,
+    "notes": "FedAvg over node1-node4 only; node5 is inference-only and scored as unseen. Rounds vary by seed per rounds.csv; local_epochs=1, min_clients=3. Headline scores the final registered model (latest.json); best.json tracks the evaluated checkpoint with the lowest weighted validation loss. Raw = filled but unclipped targets; clipped = p99.5 targets. Headline = raw_unclipped.",
+    "parameters": 9025,
+    "r2_clipped_mean": 0.9491799808526836,
+    "r2_clipped_std": 0.0008368115570035381,
+    "r2_raw_mean": 0.9471760303643219,
+    "r2_raw_std": 0.000556436099502934,
+    "rmse_clipped_mean": 23.500063585823728,
+    "rmse_clipped_std": 0.19337637996506077,
+    "rmse_raw_mean": 24.270880539443056,
+    "rmse_raw_std": 0.12786557640930224,
+    "seeds": "42,43,44",
+    "train_seconds_mean": 94.97433333333333
+  },
+  "bytes": {
+    "chunks_at_16k": 3,
+    "mean_wire_bytes_down_per_round": 100554.8,
+    "mean_wire_bytes_total_per_round": 298931.53333333327,
+    "mean_wire_bytes_up_per_round": 198376.7333333333,
+    "n_features": 5,
+    "n_train_windows": 27955,
+    "one_float32_weight_vector_bytes": 36100,
+    "raw_feature_row_bytes": 335736,
+    "raw_windowed_tensor_bytes": 13418400,
+    "window_hours": 24
+  },
+  "created_utc": "2026-11-05T12:08:25Z",
+  "method": "federated_improved_w24",
+  "seed_results": [
+    {
+      "best_round": 13,
+      "best_version": "v0013",
+      "best_weighted_val_loss": 0.0017574798693592443,
+      "bytes": {
+        "completed_rounds": 15,
+        "mean_bytes_down": 100554.93333333333,
+        "mean_bytes_total": 298931.73333333334,
+        "mean_bytes_up": 198376.8,
+        "mean_round_seconds": 5.398333333333334,
+        "total_bytes_down": 1508324,
+        "total_bytes_up": 2975652
+      },
+      "latest_round": 15,
+      "latest_version": "v0015",
+      "latest_weighted_val_loss": null,
+      "pooled_metrics": {
+        "mae_clipped": 13.430039137695344,
+        "mae_raw": 13.747041896905637,
+        "r2_clipped": 0.9483060413120775,
+        "r2_raw": 0.946637174133989,
+        "rmse_clipped": 23.701799668648427,
+        "rmse_raw": 24.394585498080133
+      },
+      "rounds_completed": 15,
+      "seed": 42,
+      "unseen_nodes": {
+        "node5": {
+          "mae_clipped": 12.46325842743595,
+          "mae_raw": 12.51875398134532,
+          "r2_clipped": 0.9561721298500243,
+          "r2_raw": 0.9560687470458195,
+          "rmse_clipped": 22.490960357236364,
+          "rmse_raw": 22.564801605853553
+        }
+      }
+    },
+    {
+      "best_round": 14,
+      "best_version": "v0014",
+      "best_weighted_val_loss": 0.001729355728418387,
+      "bytes": {
+        "completed_rounds": 15,
+        "mean_bytes_down": 100554.73333333334,
+        "mean_bytes_total": 298931.5333333333,
+        "mean_bytes_up": 198376.8,
+        "mean_round_seconds": 5.959533333333334,
+        "total_bytes_down": 1508321,
+        "total_bytes_up": 2975652
+      },
+      "latest_round": 15,
+      "latest_version": "v0015",
+      "latest_weighted_val_loss": null,
+      "pooled_metrics": {
+        "mae_clipped": 13.245044775021395,
+        "mae_raw": 13.594521936193336,
+        "r2_clipped": 0.9499739181865812,
+        "r2_raw": 0.9477485205277616,
+        "rmse_clipped": 23.316302004293338,
+        "rmse_raw": 24.139225352176098
+      },
+      "rounds_completed": 15,
+      "seed": 43,
+      "unseen_nodes": {
+        "node5": {
+          "mae_clipped": 12.22694540745047,
+          "mae_raw": 12.290392915543901,
+          "r2_clipped": 0.9577701975675434,
+          "r2_raw": 0.9575755917923571,
+          "rmse_clipped": 22.077116110794655,
+          "rmse_raw": 22.174437965628712
+        }
+      }
+    },
+    {
+      "best_round": 14,
+      "best_version": "v0014",
+      "best_weighted_val_loss": 0.0017619526738556917,
+      "bytes": {
+        "completed_rounds": 15,
+        "mean_bytes_down": 100554.73333333334,
+        "mean_bytes_total": 298931.3333333333,
+        "mean_bytes_up": 198376.6,
+        "mean_round_seconds": 7.637,
+        "total_bytes_down": 1508321,
+        "total_bytes_up": 2975649
+      },
+      "latest_round": 15,
+      "latest_version": "v0015",
+      "latest_weighted_val_loss": null,
+      "pooled_metrics": {
+        "mae_clipped": 13.276438213842335,
+        "mae_raw": 13.622222726303288,
+        "r2_clipped": 0.9492599830593921,
+        "r2_raw": 0.947142396431215,
+        "rmse_clipped": 23.48208908452942,
+        "rmse_raw": 24.278830768072943
+      },
+      "rounds_completed": 15,
+      "seed": 44,
+      "unseen_nodes": {
+        "node5": {
+          "mae_clipped": 12.288024540020995,
+          "mae_raw": 12.351472048114424,
+          "r2_clipped": 0.9568466754679141,
+          "r2_raw": 0.9566478440428539,
+          "rmse_clipped": 22.31721239284886,
+          "rmse_raw": 22.41558485488541
+        }
+      }
+    }
+  ],
+  "unseen_node5": {
+    "node5": {
+      "mae_clipped": {
+        "mean": 12.32607612496914,
+        "std": 0.12266581916517606
+      },
+      "mae_raw": {
+        "mean": 12.386872981667883,
+        "std": 0.11822484369129972
+      },
+      "n_test": 1752,
+      "r2_clipped": {
+        "mean": 0.956929667628494,
+        "std": 0.0008022598590746559
+      },
+      "r2_raw": {
+        "mean": 0.9567640609603435,
+        "std": 0.0007601151567197518
+      },
+      "rmse_clipped": {
+        "mean": 22.29509628695996,
+        "std": 0.2078066569746822
+      },
+      "rmse_raw": {
+        "mean": 22.38494147545589,
+        "std": 0.1969776774904794
+      }
+    }
+  }
+}

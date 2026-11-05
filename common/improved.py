@@ -27,6 +27,33 @@ from common.preprocess import (
 )
 
 
+def improved_model_config(
+    config: dict[str, Any], *, window_hours: int = 24, seed: int = 42
+) -> dict[str, Any]:
+    """Return the shared improved-24h architecture metadata.
+
+    Nodes, the server, and registered models all use this one description, so a
+    received weight vector can always be rebuilt into the same Keras graph.
+    """
+    model_cfg = config.get("model", {})
+    features = list(config.get("features", ["pm25", "temp", "rh"]))
+    return {
+        "architecture": "cnn_rnn_improved",
+        "window_hours": int(window_hours),
+        "n_features": len(features) + 2,
+        "conv_filters": int(model_cfg.get("conv_filters", 64)),
+        "kernel_size": int(model_cfg.get("kernel_size", 2)),
+        "pool_size": 1,
+        "rnn_units": int(model_cfg.get("rnn_units", 64)),
+        "dropout": float(model_cfg.get("dropout", 0.2)),
+        "learning_rate": float(model_cfg.get("learning_rate", 0.001)),
+        "seed": int(seed),
+        "horizon": 1,
+        "delta": True,
+        "cyclic_hour": True,
+    }
+
+
 def prepare_improved_node(
     raw: pd.DataFrame,
     node_id: str,
@@ -173,18 +200,27 @@ def prepare_improved_nodes(
     horizon: int = 1,
     delta: bool = True,
     cyclic_hour: bool = True,
+    node_ids: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Run :func:`prepare_improved_node` for every node in the config."""
+    """Run :func:`prepare_improved_node` for every node in the config.
+
+    Pass *node_ids* to prepare an explicit subset, e.g. node1-node4 for the fair
+    federated comparison that excludes the inference-only node5.
+    """
     scaler = config.get("scaler")
     if not scaler:
         raise ValueError(
             "config.json has no scaler; run: python -m common.preprocess --build-config"
         )
+    selected = list(node_ids) if node_ids is not None else list(config["nodes"])
+    unknown = sorted(set(selected).difference(config["nodes"]))
+    if unknown:
+        raise ValueError(f"unknown node_id(s): {unknown}")
     return {
         node_id: prepare_improved_node(
             raw,
             node_id=node_id,
-            year=int(year),
+            year=int(config["nodes"][node_id]),
             scaler=scaler,
             features=list(config["features"]),
             window_hours=window_hours,
@@ -194,7 +230,7 @@ def prepare_improved_nodes(
             train_fraction=float(config["train_fraction"]),
             val_fraction_of_train=float(config["val_fraction_of_train"]),
         )
-        for node_id, year in config["nodes"].items()
+        for node_id in selected
     }
 
 
