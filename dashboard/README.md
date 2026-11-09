@@ -10,25 +10,36 @@ communication byte counts.
 
 ## Stack
 
-- **Backend:** Python FastAPI (`dashboard/backend/`), Paho MQTT observer
-  (`dashboard/backend/mqtt_observer.py`), WebSocket notification channel
-  (`/ws`), read-only endpoints over the existing registry and CSV experiment
-  files.
-- **Frontend:** React 18 + TypeScript + Vite, Tailwind CSS, Recharts, Lucide
-  icons. Five hash-routed pages plus a data-source aware status bar.
+- **Backend:** Python FastAPI (`backend/`), Paho MQTT observer (`backend/mqtt_observer.py`),
+  WebSocket notification channel (`/ws`), read-only endpoints over the existing
+  registry and CSV experiment files.
+- **Frontend:** React 18 + TypeScript + Vite, Tailwind CSS, Lucide icons. Five
+  hash-routed pages plus a data-source aware status bar. TypeScript source lives
+  under `frontend/src`; the package manager is npm; commands are `npm run typecheck`
+  and `npm run dev`.
 
 ## Setup
 
 Requirements: a Python 3.12 virtualenv with `paho-mqtt`, `fastapi`,
-`uvicorn[standard]`, `httpx`, `numpy`, `pandas`. (TensorFlow is not required for
-the dashboard — only `dashboard/requirements.txt` adds the web stack.)
+`uvicorn[standard]`, `httpx`, `numpy`, `pandas`. TensorFlow is not required for the
+dashboard. Install the server-side dependencies first:
 
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt           # server-side deps first
-python -m pip install -r dashboard/requirements.txt  # fastapi/uvicorn/httpx
-npm install                                    # once, per machine
+```
+
+Then install the web stack (`dashboard/requirements.txt` adds fastapi/uvicorn/httpx):
+
+```bash
+python -m pip install -r dashboard/requirements.txt
+```
+
+Finally install the frontend once, per machine:
+
+```bash
+npm install   # from the repo root, reads frontend/package.json automatically
 ```
 
 ## Run the backend
@@ -53,7 +64,7 @@ Endpoints:
 | GET | `/api/communication` | MQTT events, bytes up/down, ack rates |
 | WS | `/ws` | Live telemetry push |
 
-The dashboard serves the built frontend from `dashboard/frontend/dist` if it exists;
+The dashboard serves the built frontend from `frontend/dist` if it exists;
 otherwise the SPA route falls back to the API list on `/`.
 
 ## Run the frontend
@@ -112,3 +123,11 @@ TelemetryStore ingest state machine (round lifecycle, checksum verification,
 rejected acks), metrics comparison assembly, and all six REST endpoints plus
 the WebSocket hello exchange. They skip MQTT integration entirely by driving
 TelemetryStore directly, so the suite runs without a running broker.
+
+## Configuration / workflow conventions
+
+This repository uses a small Claude Code configuration at the root,
+`CLAUDE.md`, to route skills. When a request matches an available skill, invoke it
+via the `Skill` tool (brainstorming → `/office-hours`, strategy → `/plan-ceo-review`,
+architecture review → `/plan-eng-review`, design consultation → `/design-consultation`,
+QA → `/qa`, review → `/review`, ship → `/ship`).
