@@ -1,0 +1,1 @@
+- [2026-11-05]: Live five-node topology confirmed: all five nodes online (4 training, 1 inference), 5 rounds complete with 35 total weighted-validation-loss values. Live events flowing: 115 pushed (started/ack/global announce). No rebuilds required since training nodes don't change direction.

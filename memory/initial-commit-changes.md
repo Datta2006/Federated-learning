@@ -1,0 +1,1 @@
+- [2026-11-05 18:43]: Dashboard __init__.py removed; dashboard added to project-root .gitignore; dashboard/backend/__init__.py removed; all existing tests pass (89 passed); tool reference explored; per-node snapshot endpoint implemented.

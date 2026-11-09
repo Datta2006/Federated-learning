@@ -1,0 +1,63 @@
+Brainstorming Ideas Into Designs — Stored Summary
+=================================================
+
+Project:  Federated PM2.5 Forecasting on IoT nodes (stage 4)
+Date:     2026-11-06
+Session:  Long conversation, JSONL transcript replay
+
+Contents
+--------
+A compact prose index of every idea surfaced, plus decisions made, questions
+that remained open, and the low-level reasons behind a few big bets.
+
+What changed over time
+----------------------
+1. Stale chart rendering. ChartRequest uses a "today" snap that refreshes
+   each request. Refreshes silently weaken provenance, so even anchored
+   snapshots drift once dates shift past their original day. Fixed by making
+   the update trigger explicit (`chartUpdateArg`), preserving old provenance.
+2. Blank chart fallback missing two link components. JS imports skipped the
+   Anchor/SettingsLink at module scope; falls through `undefined`. Import order
+   was pushed back and unused imports removed (`import LinkSettingsLink,
+   Anchor, ..."` -> kept the `Anchor` reference in one offscreen stub).
+3. Single file per `State` field caused type chaos + grep noise. Split into
+   `/<state>/state.<fields>.js` files, one `export const <State>` per
+   module. Keeping every field in its own module means any State view is a
+   pure re-export of already-tested code paths (incl. `UnknownState`,
+   `redactedSignal`, `signalHeading`, `logEntries`). Import churn stays tiny
+   when adding a State view because the dependency list is local.
+4. Dashboard provenance blind spots. The dashboard had no registry-sync vs
+   live broker sync toggle for `__explore`. Added the source filter panel
+   plus an `ExploreSummary` component so explore could flip `sourceMode`,
+   see broker state, and show live events instead of drifting snapshots.
+5. Chart import-order race still present at the design stage but fixed by the
+   above two items. Nothing new to add here except a note that nothing
+   architectural was deferred into planning mode this turn.
+
+Decisions recorded inline
+-------------------------
+* Fix stale `requestToday` immediately at first use rather than casting
+  and praying — provenance (the harder concern for students) is more important
+  than a code smell.
+* Acceptance tests were the review gate for the dashboard refactor; no
+  untested, half-formed screens shipped.
+* For future dashboard work, a small source-filter panel beats silently
+  overwriting snapshot provenance.
+
+Known open issues (retained after implementation, not re-opened today)
+---------------------------------------------------------------------
+* The Notes dialog currently shows its subject as the general prompt rather
+  than the journal entry itself — fixed only by discussion, not by code.
+* Data provenance of the underlying CSV sources remains partially opaque
+  without an explicit data catalog; documented in README appendices.
+
+Highlights worth recording for reviewers
+---------------------------------------
+* Pattern of "State fields split into per-file modules" is now reusable
+  inside the larger repo — any existing or future `<State>` can share it.
+* Pull-in recommendation for a dashboard-only diff: tests, imports, one
+  component, and a ProvenanceSummary widget do roughly 90% of the review
+  landscape. More may come next round.
+* The `brainspace/notes2026-11-06.md` and `initial-commit-changes.md`
+  summary files above are themselves helpful for continuity — reading both
+  together should reproduce the bulk of the final decisions here.

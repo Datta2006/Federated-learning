@@ -1,0 +1,3 @@
+- [2026-11-04]: README updated with dashboard instructions, per-node snapshots, badge components, live events panel, WS URL resolution, status bar, and benchmark notes.
+- [2026-11-04]: Implemented stat tile (`Kpi`), status column (`StatusBadge`), data rows, text link, time progress bar (`Bar`), Empty State component with icon + action, Simple Link component for code references, Note / SourceTag / SourceLink display components, segmented selector with transitions, Recall component for memory context, ParentSelector component for choosing registry entries (latest/best/version), and StateBadge component for round phase display.
+- [2026-11-05]: Baseline implementation completed and committed.
