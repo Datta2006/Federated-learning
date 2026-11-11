@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 
 export const ROUTES = [
   "overview",
+  "workers",
   "federated",
   "air",
   "performance",

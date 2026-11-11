@@ -312,6 +312,264 @@ def test_dataset_parser_fills_leading_gap() -> None:
     assert rows[2]["pm25_filled"] == 30.0
 
 
+def test_dynamic_worker_presence_expiry_and_roles() -> None:
+    store = _store()
+    store.set_broker_state(True, now=100.0)
+
+    # A retained registration is history only: it must not imply online.
+    store.ingest(
+        "aq/fl/workers/sim-1/register",
+        {
+            "message_type": "worker_register",
+            "worker_id": "sim-1",
+            "role": "training",
+            "dataset": "simulation",
+            "n_samples": 1000,
+            "n_val": 100,
+            "ts": "2026-11-05T12:00:00Z",
+        },
+        retain=True,
+        now=100.0,
+    )
+    snapshot = store.status_payload({"available": False, "rounds": []}, now=101.0)
+    worker = snapshot["workers"][0]
+    assert worker["id"] == "sim-1"
+    assert worker["online"] is False
+    assert worker["status"] == "unknown"
+
+    # A live state heartbeat is proof of life.
+    store.ingest(
+        "aq/fl/workers/sim-1/state",
+        {
+            "message_type": "worker_state",
+            "worker_id": "sim-1",
+            "state": "available",
+            "current_round": 3,
+            "progress": 0.5,
+        },
+        now=102.0,
+    )
+    store.ingest(
+        "aq/fl/workers/infer-1/register",
+        {
+            "message_type": "worker_register",
+            "worker_id": "infer-1",
+            "role": "inference",
+            "dataset": "simulation",
+            "n_samples": 0,
+            "n_val": 0,
+        },
+        now=102.0,
+    )
+    store.ingest(
+        "aq/fl/workers/infer-1/state",
+        {
+            "message_type": "worker_state",
+            "worker_id": "infer-1",
+            "state": "available",
+        },
+        now=102.5,
+    )
+    snapshot = store.status_payload({"available": False, "rounds": []}, now=103.0)
+    workers = {item["id"]: item for item in snapshot["workers"]}
+    assert workers["sim-1"]["online"] is True
+    assert workers["sim-1"]["selectable"] is True
+    assert workers["infer-1"]["online"] is True
+    assert workers["infer-1"]["selectable"] is False
+    assert snapshot["worker_counts"]["online"] == 2
+    assert snapshot["worker_counts"]["training"] == 1
+    assert snapshot["worker_counts"]["inference"] == 1
+    assert snapshot["worker_counts"]["available"] == 1
+
+    # Old heartbeat -> stale, never online merely because it is retained.
+    later = store.status_payload({"available": False, "rounds": []}, now=200.0)
+    later_workers = {item["id"]: item for item in later["workers"]}
+    assert later_workers["sim-1"]["online"] is False
+    assert later_workers["sim-1"]["status"] == "stale"
+    assert later["worker_counts"]["online"] == 0
+
+
+def test_dynamic_round_progress_and_summary_are_authoritative() -> None:
+    store = _store()
+    store.set_broker_state(True, now=100.0)
+    stages = {
+        "waiting_for_workers": "complete",
+        "client_selection": "complete",
+        "model_distribution": "complete",
+        "local_training": "active",
+        "update_upload": "pending",
+        "update_validation": "pending",
+        "aggregation": "pending",
+        "model_registration": "pending",
+    }
+    store.ingest(
+        "aq/fl/round/4/progress",
+        {
+            "message_type": "round_progress",
+            "round": 4,
+            "stage": "local_training",
+            "status": "active",
+            "stages": stages,
+            "model_version": "v0003",
+            "selected": ["sim-1", "sim-2"],
+            "accepted": [],
+            "rejected": {},
+            "bytes_up": 0,
+            "bytes_down": 1000,
+            "single_client": False,
+        },
+        retain=True,
+        now=100.0,
+    )
+    snapshot = store.status_payload({"available": False, "rounds": []}, now=101.0)
+    round_view = snapshot["current_round"]
+    assert round_view["source"] == "coordinator"
+    assert round_view["round"] == 4
+    current_stages = {item["key"]: item["status"] for item in round_view["stages"]}
+    assert current_stages["local_training"] == "active"
+    assert current_stages["aggregation"] == "pending"
+    assert round_view["single_client"] is False
+
+    # A failed summary must show skipped aggregation, never complete.
+    store.ingest(
+        "aq/fl/round/4/summary",
+        {
+            "message_type": "round_summary",
+            "round": 4,
+            "status": "insufficient_updates",
+            "selected": ["sim-1", "sim-2"],
+            "accepted": ["sim-1"],
+            "rejected": {"sim-2": "checksum mismatch"},
+            "checksums": {"sim-1": "a" * 64},
+            "model_version": None,
+            "evaluated_version": "v0003",
+            "weighted_val_loss": None,
+            "bytes_up": 500,
+            "bytes_down": 1000,
+            "seconds": 2.5,
+            "single_client": False,
+            "aggregated": False,
+        },
+        retain=True,
+        now=102.0,
+    )
+    snapshot = store.status_payload({"available": False, "rounds": []}, now=103.0)
+    round_view = snapshot["current_round"]
+    final_stages = {item["key"]: item["status"] for item in round_view["stages"]}
+    assert round_view["status"] == "insufficient_updates"
+    assert round_view["reasons"]["sim-2"] == "checksum mismatch"
+    assert final_stages["aggregation"] == "skipped"
+    assert final_stages["model_registration"] == "skipped"
+    assert round_view["aggregated"] is False
+    assert snapshot["round_summaries"][0]["round"] == 4
+
+
+def test_control_endpoints_publish_real_commands(tmp_path: Path) -> None:
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from common.worker_protocol import build_session_state
+    from dashboard.backend.main import create_app
+
+    registry = _write_registry(tmp_path)
+    settings = replace(
+        Settings.load(),
+        mqtt_enabled=False,
+        registry_dir=registry,
+        registry_source="test",
+        dataset_path=tmp_path / "data.csv",
+        predictions_path=tmp_path / "predictions.json",
+    )
+    app = create_app(settings)
+    state = app.state.airfed
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, dict]] = []
+
+        def publish(self, command: str, **kwargs) -> None:
+            self.commands.append((command, kwargs))
+            state_of_session = {
+                "start_session": "waiting",
+                "pause_session": "paused",
+                "resume_session": "running",
+                "stop_session": "stopped",
+            }[command]
+            message = build_session_state(
+                session_id="sess-test",
+                state=state_of_session,
+                config=kwargs.get("config"),
+                message="fake coordinator",
+            )
+            state.store.ingest("aq/fl/session", message)
+
+    controller = FakeController()
+    state.controller = controller
+
+    class FakeProcesses:
+        def status_of(self, name: str):
+            return {"name": name, "running": True, "pid": 1}
+
+        def status(self):
+            return {
+                "broker": {"reachable": True, "owned": False},
+                "processes": [],
+                "coordinator": self.status_of("coordinator"),
+                "workers": [],
+                "crashes": [],
+                "runtime_dir": "test",
+            }
+
+        def stop_all(self):
+            return []
+
+    state.processes = FakeProcesses()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/control/session",
+            json={
+                "action": "start",
+                "config": {
+                    "mode": "fixed",
+                    "rounds": 2,
+                    "min_workers": 1,
+                    "launch_workers": False,
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["ok"] is True
+        assert body["session"]["state"] == "waiting"
+        assert controller.commands[0][0] == "start_session"
+        assert controller.commands[0][1]["config"]["rounds"] == 2
+
+        for action, expected in (
+            ("pause", "paused"),
+            ("resume", "running"),
+            ("stop", "stopped"),
+        ):
+            response = client.post(
+                "/api/control/session", json={"action": action}
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["session"]["state"] == expected
+
+        assert [command for command, _ in controller.commands] == [
+            "start_session",
+            "pause_session",
+            "resume_session",
+            "stop_session",
+        ]
+
+        invalid = client.post(
+            "/api/control/session",
+            json={"action": "start", "config": {"mode": "nonsense"}},
+        )
+        assert invalid.status_code == 409
+
+
 def test_api_endpoints_and_websocket(tmp_path: Path) -> None:
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
@@ -342,9 +600,19 @@ def test_api_endpoints_and_websocket(tmp_path: Path) -> None:
             "/api/metrics",
             "/api/air-quality?node=node5",
             "/api/communication",
+            "/api/workers",
+            "/api/session",
+            "/api/rounds/live",
+            "/api/processes",
         ]:
             response = client.get(path)
             assert response.status_code == 200, (path, response.text)
+        assert client.get("/api/workers").json()["counts"]["total"] == 0
+        assert client.get("/api/session").json()["available"] is False
+        invalid = client.post("/api/processes/start", json={"name": "nope"})
+        assert invalid.status_code == 409
+        launch = client.post("/api/workers/launch", json={"count": 1})
+        assert launch.status_code == 409
         status = client.get("/api/status").json()
         assert status["registry"]["source"] == "test"
         assert status["latest_model"]["model_version"] == "v0002"

@@ -24,17 +24,54 @@ pre-Stage-3 improved model variant:
   pooling, hour sin/cos), a 6-hour-ahead comparison, a commented LAN broker
   profile, and a two-node retained-status/LWT integration test.
 
-Dataset replay, prediction publishing, the dashboard, and phone/Termux
-inference are later stages. The live federated topology is **four training
-nodes (`node1`–`node4`) plus one inference-only node (`node5`, the phone)**.
-The phone does not train, does not upload weights, and its code must not import
-TensorFlow; it may only publish status, health, and predictions. The server
-enforces this through `federated.training_nodes` and
-`federated.inference_only_nodes` in `common/config.json`. The Stage 1 baselines
-still use all five data years; the Stage 4 comparison uses node1-node4 and
-scores node5 separately as unseen data.
+## Dynamic dashboard-controlled platform
+
+The dashboard is no longer read-only. It is the control plane for a dynamic
+federated deployment:
+
+- Arbitrary worker counts (1, 2, 4, 10, 100+) without hardcoded client lists.
+- Workers self-register with ID, role, dataset/shard, sample counts, model
+  compatibility, and heartbeat; they may join or leave between rounds.
+- A retained registration never implies online. Only fresh heartbeats keep a
+  worker selectable; expired workers become stale/offline.
+- Inference-only workers register and appear in the UI but never train or
+  contribute to aggregation.
+- Configurable `min_workers` / `max_workers` / all-or-random selection, fixed or
+  continuous rounds, local epochs, deadlines, learning rate, and client
+  selection. The participant list is frozen per round.
+- Sample-weighted FedAvg; single-client rounds are explicitly marked.
+- Session lifecycle commands: start, pause, resume, stop.
+- Simulated workers partition only the training portion of training years into
+  contiguous, disjoint shards. The 2014 test year is never used for training and
+  no worker receives the full dataset.
+- Six dashboard pages (Overview, Workers, Federated, Air Quality, Performance,
+  Communication) are driven by real backend state. Round stage statuses come
+  from retained coordinator progress messages, so skipped work is shown as
+  skipped.
+- The process manager launches the local broker, control coordinator, and
+  simulated workers, captures logs, refuses duplicates, detects crashes, and
+  shuts down gracefully.
+
+Start everything with one command, then use the dashboard controls:
+
+```bash
+./scripts/dev.sh     # builds frontend, starts API at http://127.0.0.1:8010
+```
+
+On the **Workers** page press **Start broker + coordinator**, launch simulated
+workers, then configure and start a session on **Federated**.
+
+The legacy five-node topology is still supported: four training nodes
+(`node1`–`node4`) plus one inference-only node (`node5`). The phone does not
+train, does not upload weights, and its code must not import TensorFlow. The
+legacy coordinator enforces this through `federated.training_nodes` and
+`federated.inference_only_nodes` in `common/config.json`.
 
 Project root: the `iot/` directory containing this README.
+
+> For a copy-paste runbook that starts the dynamic dashboard, the legacy nodes,
+> the coordinator, the offline scorer, and the dashboard for a live
+> demonstration, see [`DEMO.md`](DEMO.md).
 
 ## Stage 1 status
 
@@ -861,7 +898,7 @@ python -m pytest -q
 ruff check common baselines tests node server experiments
 ```
 
-Current result on this machine: **79 passed**, lint clean. The broker-backed
+Current result on this machine: **118 passed**, lint clean. The broker-backed
 tests skip if `mosquitto` is not installed. The real-weight test needs
 TensorFlow. Coverage includes:
 
@@ -906,6 +943,17 @@ TensorFlow. Coverage includes:
   never uploads
 - offline registry selection (`latest` vs `best` vs explicit version) and
   pooled test-slice scoring
+- worker heartbeat expiry, training/inference roles, model compatibility, and
+  all/min/max/random selection policies
+- dynamic simulation shards: contiguous, disjoint, temporally ordered, and
+  never derived from the test partition
+- process-manager duplicate refusal, crash/log capture, graceful shutdown, and
+  a real broker + control-coordinator launch/stop cycle
+- live dynamic sessions with 1, 4, and 10 dummy workers: per-round selection,
+  sample-weighted FedAvg, single-client marking, inference-only exclusion,
+  accurate retained stage progress, and model-version/round audit rows
+- a no-worker session that waits without fabricating a round, then stops and
+  publishes `completed_rounds=0`
 
 ## Methodology notes
 

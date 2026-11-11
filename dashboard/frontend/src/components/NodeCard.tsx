@@ -1,6 +1,28 @@
 import { Badge, Dot, StatusBadge } from "./ui";
 import type { NodeView } from "../types";
 
+export function NodeTopology({ nodes }: { nodes: NodeView[] }) {
+  const online = nodes.filter((node) => node.status === "online").length;
+  const training = nodes.filter((node) => node.role === "training").length;
+  const inference = nodes.filter((node) => node.role === "inference").length;
+
+  return (
+    <section id="overview-topology" className="panel p-4">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 className="text-sm font-semibold text-mist-100">Node topology</h2>
+        <span className="text-[11px] text-mist-500">
+          {online}/{nodes.length} online · {training} training · {inference} inference
+        </span>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-5">
+        {nodes.map((node) => (
+          <NodeCard key={node.id} node={node} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 interface NodeCardProps {
   node: NodeView;
 }

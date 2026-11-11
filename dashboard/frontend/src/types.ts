@@ -1,6 +1,6 @@
 export type NodeStatus = "online" | "offline" | "stale" | "unknown";
 export type NodeRole = "training" | "inference";
-export type StageStatus = "complete" | "active" | "pending";
+export type StageStatus = "complete" | "active" | "pending" | "skipped" | "failed";
 
 export interface NodeView {
   id: string;
@@ -33,6 +33,8 @@ export interface RoundView {
   rejected: string[];
   reasons: Record<string, string>;
   registered_version: string | null;
+  single_client?: boolean;
+  aggregated?: boolean;
   started_at: string | null;
   last_event_at: string | null;
   bytes_up: number;
@@ -61,6 +63,191 @@ export interface ModelRecord {
   record_path?: string;
 }
 
+export interface WorkerView {
+  id: string;
+  worker_id: string;
+  role: NodeRole;
+  dataset: string;
+  shard_index: number | null;
+  shard_count: number | null;
+  n_samples: number;
+  n_val: number;
+  model: Record<string, unknown>;
+  capabilities: Record<string, unknown>;
+  state: string | null;
+  registered_at: string | null;
+  last_seen: string | null;
+  last_seen_age_sec: number | null;
+  current_round: number | null;
+  progress: number | null;
+  phase: string | null;
+  detail: string | null;
+  update_status: string | null;
+  model_version: string | null;
+  registration_count: number;
+  online: boolean;
+  connection: "online" | "offline";
+  status: NodeStatus;
+  selectable: boolean;
+}
+
+export interface WorkerCounts {
+  total: number;
+  online: number;
+  offline: number;
+  training: number;
+  inference: number;
+  available: number;
+  busy: number;
+}
+
+export interface SessionState {
+  session_id: string | null;
+  state: string | null;
+  config: TrainingConfigInput | null;
+  round: number | null;
+  completed_rounds: number;
+  message: string | null;
+  latest_model_version: string | null;
+  updated_utc: string | null;
+  retained: boolean;
+  observed_at?: number;
+}
+
+export interface RoundProgressView {
+  round: number;
+  stage: string;
+  status: string;
+  stages: Record<string, StageStatus>;
+  model_version: string | null;
+  selected: string[];
+  accepted: string[];
+  rejected: Record<string, string>;
+  bytes_up: number;
+  bytes_down: number;
+  single_client: boolean;
+  detail: string | null;
+  observed_at?: number;
+  retained?: boolean;
+}
+
+export interface RoundSummaryView {
+  round: number;
+  status: string;
+  selected: string[];
+  accepted: string[];
+  rejected: Record<string, string>;
+  checksums: Record<string, string>;
+  model_version: string | null;
+  evaluated_version: string | null;
+  weighted_val_loss: number | null;
+  bytes_up: number;
+  bytes_down: number;
+  seconds: number;
+  single_client: boolean;
+  aggregated: boolean;
+  config: Record<string, unknown> | null;
+  detail: string | null;
+  observed_at?: number;
+  retained?: boolean;
+}
+
+export interface ProcessInfo {
+  name: string;
+  kind: string;
+  role: string | null;
+  pid: number;
+  running: boolean;
+  exit_code: number | null;
+  started_at: string | null;
+  uptime_sec: number | null;
+  command: string[];
+  log_path: string;
+}
+
+export interface CrashInfo {
+  name: string;
+  kind: string;
+  exit_code: number | null;
+  at: string;
+  log_tail: string[];
+}
+
+export interface ProcessStatus {
+  broker: { host: string; port: number; reachable: boolean; owned: boolean };
+  processes: ProcessInfo[];
+  coordinator: ProcessInfo | null;
+  workers: ProcessInfo[];
+  crashes: CrashInfo[];
+  runtime_dir: string;
+}
+
+export interface TrainingConfigInput {
+  mode: "fixed" | "continuous";
+  rounds: number;
+  min_workers: number;
+  max_workers: number | null;
+  local_epochs: number;
+  deadline_sec: number;
+  selection_strategy: "all" | "random";
+  aggregation_method: "fedavg";
+  window_hours: number;
+  learning_rate: number;
+  simulation_workers: number;
+  launch_workers: boolean;
+  worker_role: "training" | "inference";
+}
+
+export interface WorkersPayload {
+  workers: WorkerView[];
+  counts: WorkerCounts;
+  nodes: NodeView[];
+  processes: ProcessInfo[];
+  coordinator: ProcessInfo | null;
+  broker: ProcessStatus["broker"];
+  crashes: CrashInfo[];
+}
+
+export interface SessionPayload {
+  available: boolean;
+  session: SessionState | null;
+  current_round: RoundView | null;
+  round_progress: RoundView | null;
+  round_summaries: RoundSummaryView[];
+  workers: WorkerView[];
+  worker_counts: WorkerCounts;
+  processes: ProcessStatus;
+  stage_definition: { key: string; label: string }[];
+}
+
+export interface LiveRoundsPayload {
+  session: SessionState | null;
+  current_round: RoundView | null;
+  round_progress: RoundView | null;
+  summaries: RoundSummaryView[];
+  stage_definition: { key: string; label: string }[];
+}
+
+export interface CommandResponse {
+  ok: boolean;
+  command?: string;
+  message?: string;
+  config?: TrainingConfigInput;
+  session?: SessionState | null;
+  readiness?: unknown;
+  processes?: ProcessStatus;
+  started?: ProcessInfo[];
+  skipped?: string[];
+  stopped?: string[];
+}
+
+export interface LogPayload {
+  name: string;
+  path: string;
+  lines: string[];
+  running: boolean;
+}
+
 export interface StatusPayload {
   server_time: string;
   data_source: "live_mqtt" | "registry_only" | "unavailable";
@@ -81,6 +268,12 @@ export interface StatusPayload {
     round_stale_after_sec: number;
   };
   nodes: NodeView[];
+  workers?: WorkerView[];
+  worker_counts?: WorkerCounts;
+  session?: SessionState | null;
+  round_progress?: RoundView | null;
+  round_summaries?: RoundSummaryView[];
+  processes?: ProcessStatus;
   current_round: RoundView | null;
   round_is_live: boolean;
   round_is_stale: boolean;

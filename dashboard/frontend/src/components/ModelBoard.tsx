@@ -1,4 +1,4 @@
-import { Kpi, ModelCard, EmptyState } from "./ui";
+import { ModelCard, EmptyState } from "./ui";
 import type { ModelRecord } from "../types";
 
 /**

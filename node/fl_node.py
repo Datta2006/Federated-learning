@@ -14,6 +14,7 @@ TensorFlow and never uploads weights.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import queue
 import signal
@@ -54,6 +55,12 @@ from common.weight_transfer import (
     split_weight_payload,
     validate_header,
 )
+from common.worker_protocol import (
+    build_worker_register,
+    build_worker_state,
+    worker_register_topic,
+    worker_state_topic,
+)
 from node.node_client import make_health, make_status
 from server.dag_runner import DAG, Task, run_dag
 
@@ -63,6 +70,12 @@ STOP = threading.Event()
 
 class NodeRoundError(RuntimeError):
     """Raised when one node-side round cannot continue."""
+
+
+def _stable_seed(worker_id: str) -> int:
+    """Deterministic non-negative integer for arbitrary worker IDs."""
+    digest = hashlib.sha256(worker_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") % 100_000
 
 
 class FederatedNode:
@@ -86,13 +99,26 @@ class FederatedNode:
         ack_timeout: float = 30.0,
         keepalive: int = 30,
         run_seconds: float | None = None,
+        allow_dynamic: bool = False,
+        simulation: bool = False,
+        shard_index: int | None = None,
+        shard_count: int | None = None,
     ) -> None:
         self.config = load_config(config_path)
-        if node_id not in self.config.get("nodes", {}):
+        self.allow_dynamic = bool(allow_dynamic)
+        self.simulation = bool(simulation)
+        self.shard_index = shard_index
+        self.shard_count = shard_count
+        if not self.allow_dynamic and node_id not in self.config.get("nodes", {}):
             raise ValueError(
                 f"unknown node_id {node_id!r}; "
-                f"expected one of {sorted(self.config.get('nodes', {}))}"
+                f"expected one of {sorted(self.config.get('nodes', {}))} "
+                "(pass --dynamic for an arbitrary worker ID)"
             )
+        if self.allow_dynamic and shard_index is None and self.simulation:
+            raise ValueError("--shard-index is required with --simulation")
+        if self.allow_dynamic and shard_count is None and self.simulation:
+            raise ValueError("--shard-count is required with --simulation")
         mqtt_cfg = self.config.get("mqtt", {})
         self.node_id = node_id
         self.host = str(host or mqtt_cfg.get("host", "127.0.0.1"))
@@ -107,8 +133,13 @@ class FederatedNode:
         self.inference_only = bool(
             inference_only or node_id in inference_only_node_ids(self.config)
         )
-        if not self.inference_only and node_id not in training_node_ids(self.config):
+        if (
+            not self.inference_only
+            and not self.allow_dynamic
+            and node_id not in training_node_ids(self.config)
+        ):
             raise ValueError(f"{node_id!r} is not a training node")
+        self.role = "inference" if self.inference_only else "training"
         self.dummy = bool(dummy)
         self.dummy_value = float(dummy_value)
         self.dummy_samples = int(dummy_samples)
@@ -119,6 +150,17 @@ class FederatedNode:
 
         self.status_topic = node_topic(self.base_topic, self.node_id, "status")
         self.health_topic = node_topic(self.base_topic, self.node_id, "health")
+        self.register_topic = worker_register_topic(self.base_topic, self.node_id)
+        self.worker_state_topic = worker_state_topic(self.base_topic, self.node_id)
+        self._worker_state = "available"
+        self._worker_detail: str | None = None
+        self._worker_state_lock = threading.Lock()
+        self._round_number: int | None = None
+        self._round_phase: str | None = None
+        self._round_progress: float | None = None
+        self._update_status: str | None = None
+        self._dataset_label = "unknown"
+        self._registered = False
 
         self.client: mqtt.Client | None = None
         self._inbox: queue.Queue[tuple[str, bytes]] = queue.Queue()
@@ -143,38 +185,62 @@ class FederatedNode:
         if self.dummy:
             self.model_config = {}
             self._training_ready = True
+            self._dataset_label = "dummy"
             return
-        from common.improved import improved_model_config, prepare_improved_node
+        from common.improved import improved_model_config
         from common.model import build_model_from_config
         from common.preprocess import load_raw
 
         if "scaler" not in self.config or "dataset_path" not in self.config:
             raise ValueError("config.json needs dataset_path and scaler")
         raw = load_raw(resolve_path(self.config["dataset_path"]))
-        year = int(self.config["nodes"][self.node_id])
-        self.prepared = prepare_improved_node(
-            raw,
-            node_id=self.node_id,
-            year=year,
-            scaler=self.config["scaler"],
-            features=list(self.config["features"]),
-            window_hours=self.window_hours,
-            horizon=1,
-            delta=True,
-            cyclic_hour=True,
-            train_fraction=float(self.config["train_fraction"]),
-            val_fraction_of_train=float(self.config["val_fraction_of_train"]),
-        )
+        if self.simulation:
+            from common.simulation import prepare_simulation_shard
+
+            shard = prepare_simulation_shard(
+                raw,
+                self.config,
+                n_workers=int(self.shard_count or 1),
+                shard_index=int(self.shard_index or 0),
+                window_hours=self.window_hours,
+            )
+            self.prepared = shard["prepared"]
+            year = int(shard["year"])
+            self.shard_index = int(shard["shard_index"])
+            self.shard_count = int(shard["shard_count"])
+            self.n_samples = int(shard["n_samples"])
+            self.n_val = int(shard["n_val"])
+            self._dataset_label = "simulation"
+        else:
+            from common.improved import prepare_improved_node
+
+            year = int(self.config["nodes"][self.node_id])
+            self.prepared = prepare_improved_node(
+                raw,
+                node_id=self.node_id,
+                year=year,
+                scaler=self.config["scaler"],
+                features=list(self.config["features"]),
+                window_hours=self.window_hours,
+                horizon=1,
+                delta=True,
+                cyclic_hour=True,
+                train_fraction=float(self.config["train_fraction"]),
+                val_fraction_of_train=float(self.config["val_fraction_of_train"]),
+            )
+            self.n_samples = len(self.prepared["X_train"])
+            self.n_val = len(self.prepared["X_val"])
+            self._dataset_label = f"year:{year}"
+
         self.model_config = improved_model_config(
             self.config, window_hours=self.window_hours, seed=self.seed
         )
         self.model = build_model_from_config(self.model_config)
         self._training_ready = True
         print(
-            f"{self.node_id} ready: year={year} "
-            f"train={len(self.prepared['X_train'])} "
-            f"val={len(self.prepared['X_val'])} "
-            f"test={len(self.prepared['X_test'])} "
+            f"{self.node_id} ready: year={year} dataset={self._dataset_label} "
+            f"shard={self.shard_index}/{self.shard_count} "
+            f"train={self.n_samples} val={self.n_val} "
             f"parameters={int(self.model.count_params())}",
             flush=True,
         )
@@ -222,10 +288,95 @@ class FederatedNode:
             qos=self.qos,
             retain=True,
         )
+        self._publish_registration()
+        self._publish_worker_state("available", detail="waiting for a round")
+        self._registered = True
         print(
             f"{self.node_id} online at {self.host}:{self.port} "
-            f"inference_only={self.inference_only}",
+            f"inference_only={self.inference_only} role={self.role}",
             flush=True,
+        )
+
+    def _publish_registration(self) -> None:
+        if self.client is None:
+            return
+        model = (
+            {"kind": "dummy", "parameters": int(self.dummy_count)}
+            if self.dummy
+            else dict(self.model_config)
+        )
+        n_samples = 0 if self.inference_only else int(self.n_samples if hasattr(self, "n_samples") else 0)
+        n_val = 0 if self.inference_only else int(self.n_val if hasattr(self, "n_val") else 0)
+        message = build_worker_register(
+            self.node_id,
+            role=self.role,
+            dataset=self._dataset_label,
+            n_samples=n_samples,
+            n_val=n_val,
+            model=model,
+            shard_index=self.shard_index,
+            shard_count=self.shard_count,
+            capabilities={
+                "tensorflow": not self.inference_only,
+                "simulation": self.simulation,
+                "dummy": self.dummy,
+            },
+        )
+        info = publish_json(
+            self.client,
+            self.register_topic,
+            message,
+            qos=self.qos,
+            retain=True,
+        )
+        info.wait_for_publish(timeout=10.0)
+
+    def _publish_worker_state(
+        self,
+        state: str,
+        *,
+        detail: str | None = None,
+        round_number: int | None = None,
+        progress: float | None = None,
+        phase: str | None = None,
+        update_status: str | None = None,
+    ) -> None:
+        if self.client is None:
+            return
+        with self._worker_state_lock:
+            self._worker_state = state
+            self._worker_detail = detail
+            if round_number is not None:
+                self._round_number = round_number
+            if phase is not None:
+                self._round_phase = phase
+            if progress is not None:
+                self._round_progress = progress
+            if update_status is not None:
+                self._update_status = update_status
+        try:
+            message = build_worker_state(
+                self.node_id,
+                state=state,
+                current_round=self._round_number,
+                progress=self._round_progress,
+                phase=self._round_phase,
+                detail=detail,
+                n_samples=None if self.inference_only else getattr(self, "n_samples", None),
+                model_version=self._global_model.metadata.get("model_version")
+                if self._global_model is not None
+                else None,
+                update_status=self._update_status,
+            )
+        except (TypeError, ValueError) as exc:  # pragma: no cover
+            LOGGER.warning("could not build worker state: %s", exc)
+            return
+        publish_json(
+            self.client,
+            self.worker_state_topic,
+            message,
+            qos=self.qos,
+            retain=False,
         )
 
     def _on_connect(
@@ -407,6 +558,13 @@ class FederatedNode:
         return {}
 
     def _task_evaluate(self, context: dict[str, Any]) -> dict[str, Any]:
+        invitation = context["invitation"]
+        self._publish_worker_state(
+            "training",
+            phase="evaluate",
+            round_number=int(invitation["round"]),
+            progress=0.1,
+        )
         if self.dummy:
             return {
                 "val_loss": abs(self.dummy_value),
@@ -432,6 +590,12 @@ class FederatedNode:
 
     def _task_local_train(self, context: dict[str, Any]) -> dict[str, Any]:
         invitation = context["invitation"]
+        self._publish_worker_state(
+            "training",
+            phase="local_train",
+            round_number=int(invitation["round"]),
+            progress=0.3,
+        )
         if self.dummy:
             weights = np.full(self.dummy_count, self.dummy_value, dtype=np.float32)
             return {
@@ -446,7 +610,7 @@ class FederatedNode:
         from common.model import flatten_weights, set_seed
 
         round_number = int(invitation["round"])
-        set_seed(self.seed + 1000 * round_number + int(self.node_id.removeprefix("node")))
+        set_seed(self.seed + 1000 * round_number + _stable_seed(self.node_id))
         learning_rate = float(
             invitation.get("learning_rate", self.model_config.get("learning_rate", 0.001))
         )
@@ -482,6 +646,12 @@ class FederatedNode:
 
         weights = np.asarray(context["weights"], dtype=np.float32)
         kind = "dummy" if context.get("dummy") else "model"
+        self._publish_worker_state(
+            "uploading",
+            phase="upload",
+            round_number=round_number,
+            progress=0.9,
+        )
         metadata = build_transfer_metadata(
             weights,
             node_id=self.node_id,
@@ -593,6 +763,30 @@ class FederatedNode:
                 f"{'; '.join(failed)}",
                 flush=True,
             )
+            self._publish_worker_state(
+                "error",
+                phase="round_failed",
+                round_number=int(invitation.get("round", 0)),
+                update_status="failed",
+                detail="; ".join(failed)[:400],
+            )
+        else:
+            ack = result.context.get("ack") or {}
+            self._publish_worker_state(
+                "available",
+                phase="idle",
+                round_number=int(invitation.get("round", 0)),
+                progress=1.0,
+                update_status=str(ack.get("status") or "uploaded"),
+                detail=(
+                    f"round {invitation.get('round')} finished"
+                    + (
+                        f" ({ack.get('reason')})"
+                        if ack.get("reason")
+                        else ""
+                    )
+                ),
+            )
         return result.success
 
     def _worker_loop(self) -> None:
@@ -620,6 +814,12 @@ class FederatedNode:
             ),
             qos=self.qos,
             retain=False,
+        )
+        # Heartbeat the dynamic registry as well.  The health topic keeps the
+        # legacy dashboard view alive; this state message is what proves the
+        # worker is still registered and online to the coordinator.
+        self._publish_worker_state(
+            self._worker_state, detail=self._worker_detail or "heartbeat"
         )
 
     def run(self) -> int:
@@ -685,6 +885,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ack-timeout", type=float, default=30.0)
     parser.add_argument("--keepalive", type=int, default=30)
     parser.add_argument("--run-seconds", type=float, default=None)
+    parser.add_argument(
+        "--dynamic",
+        action="store_true",
+        help="Allow an arbitrary worker ID and register on the FL worker topics",
+    )
+    parser.add_argument(
+        "--simulation",
+        action="store_true",
+        help="Use one contiguous shard of the training years instead of a whole year",
+    )
+    parser.add_argument("--shard-index", type=int, default=None)
+    parser.add_argument("--shard-count", type=int, default=None)
     parser.add_argument("--verbose", action="count", default=0)
     return parser
 
@@ -719,6 +931,10 @@ def _main() -> None:
             ack_timeout=args.ack_timeout,
             keepalive=args.keepalive,
             run_seconds=args.run_seconds,
+            allow_dynamic=args.dynamic,
+            simulation=args.simulation,
+            shard_index=args.shard_index,
+            shard_count=args.shard_count,
         ).run()
     )
 

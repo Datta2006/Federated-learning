@@ -1,4 +1,6 @@
 import type { ReactNode } from "react";
+import type { ModelRecord } from "../types";
+import { formatDateTime, formatInteger, formatNumber } from "../lib/format";
 import {
   AlertTriangle,
   ArrowDownRight,
@@ -191,6 +193,73 @@ export function Kpi({
       </div>
       {hint ? <div className="mt-1.5 text-[11px] leading-snug text-mist-500">{hint}</div> : null}
     </div>
+  );
+}
+
+export function SummaryRow({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div className="rounded-lg border border-ink-700/60 bg-ink-800/50 px-2.5 py-2">
+      <div className="label">{label}</div>
+      <div className="mono mt-1 text-sm font-semibold text-mist-100">{value}</div>
+    </div>
+  );
+}
+
+export function ModelCard({
+  title,
+  record,
+}: {
+  title: string;
+  record: ModelRecord | null;
+}) {
+  const parameters = record?.parameters ?? null;
+  const transferBytes = parameters === null ? null : parameters * 4;
+
+  return (
+    <article className="panel px-4 py-4">
+      <div className="flex items-baseline justify-between gap-2">
+        <h4 className="text-[12px] font-semibold text-mist-100">{title}</h4>
+        <span className="chip bg-ink-800 text-mist-500">
+          {record?.has_weights ? "weights on disk" : "metadata only"}
+        </span>
+      </div>
+      <dl className="mt-3 space-y-1.5 text-[11px]">
+        <div className="flex justify-between gap-3">
+          <dt className="text-mist-500">parameters</dt>
+          <dd className="mono text-mist-200">{formatInteger(parameters)}</dd>
+        </div>
+        <div className="flex justify-between gap-3">
+          <dt className="text-mist-500">float32 transfer</dt>
+          <dd className="mono text-mist-200">
+            {transferBytes === null ? "—" : `${formatInteger(transferBytes)} B`}
+          </dd>
+        </div>
+        <div className="flex justify-between gap-3">
+          <dt className="text-mist-500">weighted val loss</dt>
+          <dd className="mono text-mist-200">{formatNumber(record?.weighted_val_loss, 6)}</dd>
+        </div>
+        <div className="flex justify-between gap-3">
+          <dt className="text-mist-500">samples / val</dt>
+          <dd className="mono text-mist-200">
+            {formatInteger(record?.n_samples)} / {formatInteger(record?.n_val)}
+          </dd>
+        </div>
+        <div className="flex justify-between gap-3">
+          <dt className="text-mist-500">round</dt>
+          <dd className="mono text-mist-200">{formatInteger(record?.round)}</dd>
+        </div>
+        <div className="flex justify-between gap-3">
+          <dt className="text-mist-500">created</dt>
+          <dd className="mono text-right text-mist-200">{formatDateTime(record?.created_utc)}</dd>
+        </div>
+        <div className="flex justify-between gap-3">
+          <dt className="text-mist-500">sources</dt>
+          <dd className="mono text-right text-mist-200">
+            {record?.sources.length ? record.sources.join(", ") : "—"}
+          </dd>
+        </div>
+      </dl>
+    </article>
   );
 }
 

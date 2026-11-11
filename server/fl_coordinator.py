@@ -17,9 +17,11 @@ import csv
 import json
 import logging
 import queue
+import random
 import signal
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +68,22 @@ from common.weight_transfer import (
     round_update_chunk_filter,
     round_update_meta_filter,
 )
+from common.worker_protocol import (
+    ROUND_STAGE_KEYS,
+    TrainingConfig,
+    build_round_progress,
+    build_round_summary,
+    build_session_state,
+    control_topic,
+    round_progress_topic,
+    round_summary_topic,
+    session_topic,
+    validate_control,
+    validate_worker_register,
+    worker_register_filter,
+    worker_state_filter,
+)
+from common.worker_registry import WorkerRegistry
 from server.dag_runner import DAG, Task, run_dag
 
 LOGGER = logging.getLogger(__name__)
@@ -82,6 +100,11 @@ ROUND_COLUMNS = [
     "weighted_val_loss",
     "evaluated_version",
     "model_version",
+    "accepted_nodes",
+    "rejected_nodes",
+    "single_client",
+    "aggregated",
+    "status",
 ]
 
 
@@ -119,6 +142,11 @@ class RoundOutcome:
     weighted_val_loss: float | None = None
     evaluated_version: str = ""
     model_version: str = ""
+    accepted: list[str] = field(default_factory=list)
+    rejected: dict[str, str] = field(default_factory=dict)
+    single_client: bool = False
+    aggregated: bool = False
+    status: str = "failed"
 
 
 class RoundCollector:
@@ -343,6 +371,8 @@ class FederatedServer:
         dummy_count: int = 9025,
         keepalive: int = 30,
         run_seconds: float | None = None,
+        control: bool = False,
+        worker_expiry_sec: float | None = None,
     ) -> None:
         self.config = load_config(config_path)
         mqtt_cfg = self.config.get("mqtt", {})
@@ -388,6 +418,12 @@ class FederatedServer:
         self.dummy = bool(dummy)
         self.dummy_count = int(dummy_count)
         self.run_seconds = run_seconds
+        self.control_mode = bool(control)
+        self.worker_expiry_sec = float(
+            worker_expiry_sec
+            if worker_expiry_sec is not None
+            else max(3.0 * heartbeat, 20.0)
+        )
 
         self.training_nodes = training_node_ids(self.config)
         self.inference_nodes = inference_only_node_ids(self.config)
@@ -415,6 +451,30 @@ class FederatedServer:
         self._first_round_number = 1
         self._round_bytes_down = 0
         self._connected = threading.Event()
+
+        # Dynamic worker/session state (control mode only).
+        self._registry_lock = threading.RLock()
+        self.registry = WorkerRegistry(
+            expiry_sec=self.worker_expiry_sec,
+            expected_model={},
+        )
+        self._control_events: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._session_lock = threading.RLock()
+        self._session_thread: threading.Thread | None = None
+        self._session_stop = threading.Event()
+        self._session_paused = threading.Event()
+        self._session: dict[str, Any] = {
+            "session_id": None,
+            "state": "idle",
+            "config": None,
+            "round": None,
+            "completed_rounds": 0,
+            "message": "Coordinator ready",
+            "latest_model_version": None,
+            "started_utc": None,
+        }
+        self._round_stages: dict[str, str] = {}
+        self._round_selected: list[str] = []
 
         self.latest_version: str | None = None
         self.latest_weights: np.ndarray | None = None
@@ -466,14 +526,21 @@ class FederatedServer:
             LOGGER.error("connect failed: %s", reason_code)
             return
         LOGGER.info("connected to %s:%s", self.host, self.port)
-        client.subscribe(
-            [
-                (f"{self.base_topic}/+/status", self.qos),
-                (f"{self.base_topic}/+/health", self.qos),
-                (round_update_meta_filter(self.base_topic), self.qos),
-                (round_update_chunk_filter(self.base_topic), self.qos),
-            ]
-        )
+        topics = [
+            (f"{self.base_topic}/+/status", self.qos),
+            (f"{self.base_topic}/+/health", self.qos),
+            (round_update_meta_filter(self.base_topic), self.qos),
+            (round_update_chunk_filter(self.base_topic), self.qos),
+        ]
+        if self.control_mode:
+            topics.extend(
+                [
+                    (worker_register_filter(self.base_topic), self.qos),
+                    (worker_state_filter(self.base_topic), self.qos),
+                    (control_topic(self.base_topic), self.qos),
+                ]
+            )
+        client.subscribe(topics)
         self._connected.set()
 
     def _on_message(
@@ -503,6 +570,19 @@ class FederatedServer:
                 LOGGER.exception("unexpected message failure on %s", topic)
 
     def _handle_inbox(self, topic: str, payload: bytes, retain: bool) -> None:
+        workers_prefix = f"{self.base_topic}/fl/workers/"
+        if self.control_mode and topic.startswith(workers_prefix):
+            remainder = topic[len(workers_prefix) :]
+            _worker_id, _, leaf = remainder.partition("/")
+            if leaf == "register":
+                self._handle_worker_register(payload)
+                return
+            if leaf == "state":
+                self._handle_worker_state(payload)
+                return
+        if self.control_mode and topic == control_topic(self.base_topic):
+            self._handle_control(payload)
+            return
         prefix = f"{self.base_topic}/"
         if topic.startswith(prefix):
             remainder = topic[len(prefix) :]
@@ -547,6 +627,159 @@ class FederatedServer:
 
     def _handle_health(self, node_id: str) -> None:
         self._health_seen[node_id] = time.monotonic()
+
+    # ------------------------------------------------------- dynamic workers
+    def _handle_worker_register(self, payload: bytes) -> None:
+        try:
+            message = loads(payload)
+            seed = validate_worker_register(message)
+        except (TypeError, ValueError) as exc:
+            LOGGER.warning("bad worker registration: %s", exc)
+            return
+        with self._registry_lock:
+            self.registry.register(message)
+        print(
+            f"worker registered {seed.worker_id} role={seed.role} "
+            f"dataset={seed.dataset} samples={seed.n_samples}",
+            flush=True,
+        )
+
+    def _handle_worker_state(self, payload: bytes) -> None:
+        try:
+            message = loads(payload)
+        except (TypeError, ValueError) as exc:
+            LOGGER.warning("bad worker state: %s", exc)
+            return
+        with self._registry_lock:
+            self.registry.state(message)
+
+    def _handle_control(self, payload: bytes) -> None:
+        try:
+            message = loads(payload)
+            command = validate_control(message)
+        except (TypeError, ValueError) as exc:
+            LOGGER.warning("bad control message: %s", exc)
+            return
+        self._control_events.put({**message, "command": command})
+        print(f"control command received: {command}", flush=True)
+
+    def _publish_session(self) -> None:
+        if self.client is None:
+            return
+        with self._session_lock:
+            session = dict(self._session)
+        message = build_session_state(
+            session_id=session["session_id"],
+            state=session["state"],
+            config=session["config"],
+            round_number=session["round"],
+            completed_rounds=int(session["completed_rounds"]),
+            message=session["message"],
+            latest_model_version=session.get("latest_model_version")
+            or self.latest_version,
+        )
+        try:
+            info = publish_json(
+                self.client,
+                session_topic(self.base_topic),
+                message,
+                qos=self.qos,
+                retain=True,
+            )
+            info.wait_for_publish(timeout=10.0)
+        except (TypeError, ValueError) as exc:  # pragma: no cover - paho edge
+            LOGGER.warning("could not publish session state: %s", exc)
+
+    def _set_session(self, **fields: Any) -> None:
+        with self._session_lock:
+            self._session.update(fields)
+        self._publish_session()
+
+    def _publish_progress(
+        self,
+        *,
+        stage: str,
+        status: str,
+        detail: str | None = None,
+        stages: dict[str, str] | None = None,
+    ) -> None:
+        """Publish one retained round-stage snapshot."""
+        if not self.control_mode or self.client is None:
+            return
+        if self._current_round is None:
+            return
+        if stages is not None:
+            self._round_stages = dict(stages)
+        collector = self._collector
+        accepted = sorted(collector.accepted) if collector else []
+        rejected = dict(collector.rejected) if collector else {}
+        bytes_up = collector.bytes_up if collector else 0
+        bytes_down = (collector.bytes_down if collector else 0) + self._round_bytes_down
+        message = build_round_progress(
+            round_number=self._current_round,
+            stage=stage,
+            status=status,
+            stages=self._round_stages
+            or {key: "pending" for key in ROUND_STAGE_KEYS},
+            model_version=self.latest_version,
+            selected=list(self._round_selected),
+            accepted=accepted,
+            rejected=rejected,
+            bytes_up=bytes_up,
+            bytes_down=bytes_down,
+            single_client=len(self._round_selected) == 1,
+            detail=detail,
+        )
+        try:
+            publish_json(
+                self.client,
+                round_progress_topic(self.base_topic, self._current_round),
+                message,
+                qos=self.qos,
+                retain=True,
+            )
+        except (TypeError, ValueError) as exc:  # pragma: no cover
+            LOGGER.warning("could not publish round progress: %s", exc)
+
+    def _set_stage(self, stage: str, status: str, detail: str | None = None) -> None:
+        self._round_stages[stage] = status
+        self._publish_progress(stage=stage, status=status, detail=detail)
+
+    def _publish_summary(self, outcome: RoundOutcome) -> None:
+        if not self.control_mode or self.client is None:
+            return
+        checksums = {}
+        collector = self._collector
+        if collector is not None:
+            for update in collector.accepted.values():
+                checksums[update.node_id] = str(update.metadata.get("sha256", ""))
+        message = build_round_summary(
+            round_number=outcome.round_number,
+            status=outcome.status,
+            selected=outcome.selected,
+            accepted=outcome.accepted,
+            rejected=outcome.rejected,
+            checksums=checksums,
+            model_version=outcome.model_version or self.latest_version,
+            evaluated_version=outcome.evaluated_version or None,
+            weighted_val_loss=outcome.weighted_val_loss,
+            bytes_up=outcome.bytes_up,
+            bytes_down=outcome.bytes_down,
+            seconds=outcome.seconds,
+            single_client=outcome.single_client,
+            aggregated=outcome.aggregated,
+            config=(self._session.get("config") or {}),
+        )
+        try:
+            publish_json(
+                self.client,
+                round_summary_topic(self.base_topic, outcome.round_number),
+                message,
+                qos=self.qos,
+                retain=True,
+            )
+        except (TypeError, ValueError) as exc:  # pragma: no cover
+            LOGGER.warning("could not publish round summary: %s", exc)
 
     def online_training_nodes(self) -> set[str]:
         now = time.monotonic()
@@ -728,6 +961,8 @@ class FederatedServer:
         round_number: int,
         selected: list[str],
         deadline_ts: float,
+        *,
+        min_clients: int | None = None,
     ) -> int:
         if self.client is None or self.latest_version is None:
             raise RoundError("cannot start a round without a global model")
@@ -740,7 +975,7 @@ class FederatedServer:
             learning_rate=self.learning_rate,
             deadline_ts=deadline_ts,
             selected_nodes=list(selected),
-            min_clients=self.min_clients,
+            min_clients=self.min_clients if min_clients is None else min_clients,
         )
         info = publish_json(
             self.client,
@@ -974,6 +1209,13 @@ class FederatedServer:
                     ),
                     "evaluated_version": outcome.evaluated_version,
                     "model_version": outcome.model_version,
+                    "accepted_nodes": " ".join(outcome.accepted),
+                    "rejected_nodes": " ".join(
+                        f"{node}:{reason}" for node, reason in sorted(outcome.rejected.items())
+                    ),
+                    "single_client": "true" if outcome.single_client else "false",
+                    "aggregated": "true" if outcome.aggregated else "false",
+                    "status": outcome.status,
                 }
             )
 
@@ -1090,7 +1332,524 @@ class FederatedServer:
         )
         return bool(result.success)
 
+    # ------------------------------------------------------ dynamic control
+    def _trainable_workers(self) -> list[Any]:
+        with self._registry_lock:
+            return self.registry.selectable_training_workers()
+
+    def _wait_for_workers(self, config: TrainingConfig) -> list[Any]:
+        """Block until at least ``min_workers`` training workers are online."""
+        last_notice = 0.0
+        while not STOP.is_set() and not self._session_stop.is_set():
+            self._drain_inbox()
+            workers = self._trainable_workers()
+            if len(workers) >= config.min_workers:
+                return workers
+            now = time.monotonic()
+            if now - last_notice >= 5.0:
+                self._set_session(
+                    state="waiting",
+                    message=(
+                        f"Waiting for workers: {len(workers)}/"
+                        f"{config.min_workers} available"
+                    ),
+                )
+                last_notice = now
+            while self._session_paused.is_set() and not self._session_stop.is_set():
+                self._drain_inbox()
+                STOP.wait(0.2)
+            STOP.wait(0.2)
+        return self._trainable_workers()
+
+    def _select_workers(
+        self, workers: list[Any], config: TrainingConfig, round_number: int
+    ) -> list[str]:
+        ids = sorted(worker.worker_id for worker in workers)
+        cap = config.max_workers
+        if cap is not None and len(ids) > cap:
+            if config.selection_strategy == "random":
+                chooser = random.Random(self.seed + round_number)
+                ids = sorted(chooser.sample(ids, cap))
+            else:
+                ids = ids[:cap]
+        return ids
+
+    def _collect_round(
+        self, collector: RoundCollector, deadline: float
+    ) -> None:
+        last_publish = 0.0
+        upload_started = False
+        while not STOP.is_set() and not self._session_stop.is_set():
+            self._drain_inbox()
+            now = time.monotonic()
+            if not upload_started and (
+                collector.bytes_up > 0 or collector.accepted
+            ):
+                upload_started = True
+                self._round_stages["local_training"] = "complete"
+                self._set_stage(
+                    "update_upload",
+                    "active",
+                    detail=f"{collector.received}/{len(collector.selected)} updates accepted",
+                )
+            if now - last_publish >= 1.0:
+                self._publish_progress(
+                    stage="update_upload"
+                    if upload_started
+                    else "local_training",
+                    status="active",
+                    detail=(
+                        f"{collector.received}/{len(collector.selected)} accepted"
+                        if upload_started
+                        else "Workers are training locally"
+                    ),
+                )
+                last_publish = now
+            collector.expire(now)
+            if collector.all_reported or now >= deadline:
+                break
+            STOP.wait(0.05)
+        self._drain_inbox()
+        collector.expire(time.monotonic())
+
+    def _run_dynamic_round(
+        self, round_number: int, config: TrainingConfig
+    ) -> RoundOutcome:
+        started = time.monotonic()
+        self._current_round = round_number
+        self._collector = None
+        self._round_bytes_down = 0
+        self._round_selected = []
+        self._round_stages = {key: "pending" for key in ROUND_STAGE_KEYS}
+        self.local_epochs = config.local_epochs
+        self.learning_rate = config.learning_rate
+
+        # 1. Wait for and freeze this round's participant list.
+        self._round_stages["waiting_for_workers"] = "active"
+        self._publish_progress(
+            stage="waiting_for_workers",
+            status="active",
+            detail=f"Need at least {config.min_workers} worker(s)",
+        )
+        workers = self._wait_for_workers(config)
+        if STOP.is_set() or self._session_stop.is_set():
+            return self._abandoned_round(round_number, started)
+        if len(workers) < config.min_workers:
+            return self._abandoned_round(round_number, started)
+        self._round_stages["waiting_for_workers"] = "complete"
+
+        self._round_stages["client_selection"] = "active"
+        selected = self._select_workers(workers, config, round_number)
+        if len(selected) < config.min_workers:
+            return self._abandoned_round(
+                round_number,
+                started,
+                detail=(
+                    f"Only {len(selected)} worker(s) selectable; "
+                    f"need {config.min_workers}"
+                ),
+            )
+        self._round_selected = list(selected)
+        single_client = len(selected) == 1
+        self._round_stages["client_selection"] = "complete"
+        self._publish_progress(
+            stage="client_selection",
+            status="complete",
+            detail=(
+                "Single-client round: one worker's weights are accepted "
+                "without cross-client averaging"
+                if single_client
+                else f"Selected {len(selected)} worker(s) using "
+                f"{config.selection_strategy} policy"
+            ),
+        )
+
+        # 2. Distribute the global model and start the round.
+        self._set_stage("model_distribution", "active")
+        self._round_bytes_down += self._publish_current_model()
+        deadline_monotonic = time.monotonic() + config.deadline_sec
+        deadline_ts = time.time() + config.deadline_sec
+        self._round_bytes_down += self._publish_round_start(
+            round_number,
+            selected,
+            deadline_ts,
+            min_clients=config.min_workers,
+        )
+        self._collector = RoundCollector(
+            base_topic=self.base_topic,
+            round_number=round_number,
+            model_version=str(self.latest_version),
+            selected=selected,
+            deadline=deadline_monotonic,
+            training_nodes=set(selected),
+            inference_only_nodes=set(),
+            reference_weights=(
+                None if self.dummy or self.latest_weights is None else self.latest_weights
+            ),
+            ack_callback=self._publish_ack,
+        )
+        self._set_stage("model_distribution", "complete")
+        self._set_stage(
+            "local_training",
+            "active",
+            detail=f"Round deadline {config.deadline_sec:.0f}s",
+        )
+        print(
+            f"dynamic round {round_number} started model={self.latest_version} "
+            f"selected={' '.join(selected)}",
+            flush=True,
+        )
+
+        # 3. Collect and validate updates until every selected worker reports or
+        #    the round deadline expires.
+        self._collect_round(self._collector, deadline_monotonic)
+        collector = self._collector
+        accepted = list(collector.accepted.values())
+        outcome = RoundOutcome(
+            round_number=round_number,
+            selected=list(selected),
+            received=len(accepted),
+            dropped=collector.dropped_nodes,
+            accepted=sorted(collector.accepted),
+            rejected=dict(collector.rejected),
+            bytes_up=collector.bytes_up,
+            weighted_val_loss=collector.weighted_val_loss,
+            evaluated_version=collector.model_version,
+            model_version=self.latest_version or "",
+            single_client=single_client,
+        )
+        self._round_stages["local_training"] = "complete"
+        if accepted:
+            self._round_stages["update_upload"] = "complete"
+            self._round_stages["update_validation"] = "complete"
+            self._publish_progress(
+                stage="update_validation",
+                status="complete",
+                detail=(
+                    f"{len(accepted)} valid update(s); "
+                    f"{len(collector.rejected)} rejected"
+                ),
+            )
+        else:
+            self._round_stages["update_upload"] = "failed"
+            self._round_stages["update_validation"] = "skipped"
+            for stage in ("aggregation", "model_registration"):
+                self._round_stages[stage] = "skipped"
+            outcome.status = "failed"
+            outcome.seconds = time.monotonic() - started
+            outcome.bytes_down = self._round_bytes_down + collector.bytes_down
+            print(
+                f"dynamic round {round_number} failed: no valid updates "
+                f"({len(collector.rejected)} rejected)",
+                flush=True,
+            )
+            self._finish_dynamic_round(outcome, config)
+            return outcome
+
+        # 4. Aggregate only when the configured minimum was actually met.
+        if len(accepted) < config.min_workers:
+            self._round_stages["aggregation"] = "skipped"
+            self._round_stages["model_registration"] = "skipped"
+            self._publish_progress(
+                stage="aggregation",
+                status="skipped",
+                detail=(
+                    f"Only {len(accepted)} valid update(s); "
+                    f"need {config.min_workers}. No model was registered."
+                ),
+            )
+            outcome.status = "insufficient_updates"
+            outcome.seconds = time.monotonic() - started
+            outcome.bytes_down = self._round_bytes_down + collector.bytes_down
+            self._finish_dynamic_round(outcome, config)
+            return outcome
+
+        self._set_stage(
+            "aggregation",
+            "active",
+            detail=(
+                "Single-client round: copied the one accepted update"
+                if single_client
+                else f"Sample-weighted FedAvg over {len(accepted)} update(s)"
+            ),
+        )
+        weights = fedavg(
+            [update.weights for update in accepted],
+            [update.n_samples for update in accepted],
+        )
+        total_samples = sum(update.n_samples for update in accepted)
+        self._round_stages["aggregation"] = "complete"
+        self._publish_progress(
+            stage="aggregation",
+            status="complete",
+            detail=(
+                f"FedAvg aggregated {len(accepted)} update(s), "
+                f"{total_samples} samples"
+                + (" (single-client round)" if single_client else "")
+            ),
+        )
+
+        # 5. Score the model the workers evaluated, register the new version.
+        self._set_stage("model_registration", "active")
+        evaluated_loss = collector.weighted_val_loss
+        if self.latest_version and evaluated_loss is not None:
+            self._update_scored_model(
+                str(self.latest_version),
+                float(evaluated_loss),
+                sum(update.n_val for update in accepted),
+                round_number,
+            )
+        version = model_version_for_round(round_number)
+        record = self._save_model(
+            version=version,
+            weights=np.asarray(weights, dtype=np.float32),
+            model_config=self.latest_model_config,
+            round_number=round_number,
+            weighted_val_loss=None,
+            n_val=0,
+            n_samples=total_samples,
+            sources=sorted(collector.accepted),
+        )
+        self.latest_version = version
+        self.latest_weights = np.asarray(weights, dtype=np.float32)
+        self.latest_record = record
+        self._round_stages["model_registration"] = "complete"
+        self._publish_progress(
+            stage="model_registration",
+            status="complete",
+            detail=f"Registered {version}",
+        )
+        self._round_bytes_down += self._publish_current_model()
+
+        outcome.model_version = version
+        outcome.aggregated = True
+        outcome.status = "completed"
+        outcome.seconds = time.monotonic() - started
+        outcome.bytes_down = self._round_bytes_down + collector.bytes_down
+        self._finish_dynamic_round(outcome, config)
+        return outcome
+
+    def _abandoned_round(
+        self, round_number: int, started: float, detail: str | None = None
+    ) -> RoundOutcome:
+        outcome = RoundOutcome(
+            round_number=round_number,
+            selected=list(self._round_selected),
+            seconds=time.monotonic() - started,
+            model_version=self.latest_version or "",
+            status="stopped",
+        )
+        for stage, status in list(self._round_stages.items()):
+            if status in {"active", "pending"}:
+                self._round_stages[stage] = "skipped"
+        self._publish_progress(
+            stage="waiting_for_workers",
+            status="skipped",
+            detail=detail or "Session stopped before the round could run",
+        )
+        self._finish_dynamic_round(outcome, None, write_row=False)
+        return outcome
+
+    def _finish_dynamic_round(
+        self,
+        outcome: RoundOutcome,
+        config: TrainingConfig | None,
+        *,
+        write_row: bool = True,
+    ) -> None:
+        if write_row:
+            self._write_round_row(outcome)
+        self._publish_summary(outcome)
+        print(
+            f"round={outcome.round_number} status={outcome.status} "
+            f"selected={len(outcome.selected)} accepted={len(outcome.accepted)} "
+            f"rejected={len(outcome.rejected)} aggregated={outcome.aggregated} "
+            f"single_client={outcome.single_client}",
+            flush=True,
+        )
+        del config
+
+    def _run_session(self, config: TrainingConfig) -> None:
+        session_id = f"sess-{uuid.uuid4().hex[:12]}"
+        self._session_stop.clear()
+        self._session_paused.clear()
+        start_round = int(self.latest_record.get("round", 0)) + 1
+        executed = 0
+        completed = 0
+        with self._session_lock:
+            self._session.update(
+                {
+                    "session_id": session_id,
+                    "state": "waiting",
+                    "config": config.to_dict(),
+                    "round": None,
+                    "completed_rounds": 0,
+                    "message": f"Waiting for at least {config.min_workers} worker(s)",
+                    "latest_model_version": self.latest_version,
+                }
+            )
+        self._publish_session()
+        try:
+            while not STOP.is_set() and not self._session_stop.is_set():
+                while (
+                    self._session_paused.is_set()
+                    and not self._session_stop.is_set()
+                ):
+                    self._drain_inbox()
+                    self._set_session(
+                        state="paused", message="Session paused by dashboard"
+                    )
+                    STOP.wait(0.25)
+                if self._session_stop.is_set() or STOP.is_set():
+                    break
+                if config.mode == "fixed" and executed >= config.rounds:
+                    break
+                workers = self._wait_for_workers(config)
+                if self._session_stop.is_set() or STOP.is_set():
+                    break
+                if len(workers) < config.min_workers:
+                    continue
+                round_number = start_round + executed
+                self._set_session(
+                    state="running",
+                    round=round_number,
+                    message=f"Round {round_number} in progress",
+                )
+                outcome = self._run_dynamic_round(round_number, config)
+                executed += 1
+                if outcome.status == "completed":
+                    completed += 1
+                with self._session_lock:
+                    self._session.update(
+                        {
+                            "completed_rounds": completed,
+                            "latest_model_version": self.latest_version,
+                            "message": (
+                                f"Round {round_number}: {outcome.status} "
+                                f"({len(outcome.accepted)} accepted, "
+                                f"{len(outcome.rejected)} rejected)"
+                            ),
+                        }
+                    )
+                self._publish_session()
+                STOP.wait(0.5)
+            state = "stopped" if self._session_stop.is_set() and not STOP.is_set() else "completed"
+            if STOP.is_set():
+                state = "stopped"
+            self._set_session(
+                state=state,
+                round=None,
+                message=(
+                    f"Session finished: {completed} completed round(s)"
+                    if state == "completed"
+                    else "Session stopped"
+                ),
+                completed_rounds=completed,
+                latest_model_version=self.latest_version,
+            )
+        except Exception as exc:  # pragma: no cover - long-lived safety net
+            LOGGER.exception("dynamic session failed")
+            self._set_session(state="error", message=f"Session failed: {exc}")
+
+    def _handle_control_command(self, message: dict[str, Any]) -> None:
+        command = message["command"]
+        thread = self._session_thread
+        running = thread is not None and thread.is_alive()
+        if command == "start_session":
+            if running:
+                self._set_session(
+                    state=self._session["state"],
+                    message="A session is already running; stop it first",
+                )
+                return
+            try:
+                config = TrainingConfig.from_dict(message.get("config"))
+            except (TypeError, ValueError) as exc:
+                self._set_session(state="error", message=f"Invalid config: {exc}")
+                return
+            self._session_thread = threading.Thread(
+                target=self._run_session,
+                args=(config,),
+                name="fl-dynamic-session",
+                daemon=True,
+            )
+            self._session_thread.start()
+            return
+        if not running:
+            self._set_session(state="idle", message="No active session")
+            return
+        if command == "pause_session":
+            self._session_paused.set()
+            self._set_session(state="paused", message="Session paused by dashboard")
+        elif command == "resume_session":
+            self._session_paused.clear()
+            self._set_session(state="running", message="Session resumed")
+        elif command == "stop_session":
+            self._session_stop.set()
+            self._session_paused.clear()
+            self._set_session(state="stopping", message="Stopping after the current step")
+        else:  # pragma: no cover - validate_control already filters
+            LOGGER.warning("unsupported control command %s", command)
+
+    def run_control(self) -> int:
+        """Long-lived dashboard-controlled coordinator."""
+        STOP.clear()
+        self._connect()
+        try:
+            self._ensure_initial_model()
+            with self._registry_lock:
+                self.registry.expected_model = dict(self.latest_model_config)
+            self._round_bytes_down += self._publish_current_model()
+            self.kind = "dummy" if self.dummy else "model"
+            self._set_session(
+                state="idle",
+                message=(
+                    "Coordinator ready. Configure a session in the dashboard "
+                    "to start training."
+                ),
+                latest_model_version=self.latest_version,
+            )
+            print(
+                f"coordinator control mode ready model={self.latest_version} "
+                f"workers_expire_after={self.worker_expiry_sec:.0f}s",
+                flush=True,
+            )
+            deadline = (
+                time.monotonic() + self.run_seconds if self.run_seconds else None
+            )
+            while not STOP.is_set():
+                self._drain_inbox()
+                try:
+                    message = self._control_events.get_nowait()
+                except queue.Empty:
+                    message = None
+                if message is not None:
+                    self._handle_control_command(message)
+                with self._registry_lock:
+                    expired = self.registry.expire()
+                if expired:
+                    print(
+                        f"workers expired (heartbeat): {' '.join(expired)}",
+                        flush=True,
+                    )
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                STOP.wait(0.1)
+            self._session_stop.set()
+            thread = self._session_thread
+            if thread is not None:
+                thread.join(timeout=max(5.0, self.deadline_sec))
+            self._set_session(state="stopped", message="Coordinator stopped")
+        finally:
+            if self.client is not None:
+                self.client.disconnect()
+                self.client.loop_stop()
+            LOGGER.info("control server stopped")
+        return 0
+
     def run(self) -> int:
+        if self.control_mode:
+            return self.run_control()
         STOP.clear()
         self._connect()
         try:
@@ -1143,6 +1902,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dummy-count", type=int, default=9025)
     parser.add_argument("--keepalive", type=int, default=30)
     parser.add_argument("--run-seconds", type=float, default=None)
+    parser.add_argument(
+        "--control",
+        action="store_true",
+        help="Run the long-lived dashboard-controlled coordinator",
+    )
+    parser.add_argument("--worker-expiry-sec", type=float, default=None)
     parser.add_argument("--verbose", action="count", default=0)
     return parser
 
@@ -1182,6 +1947,8 @@ def _main() -> None:
             dummy_count=args.dummy_count,
             keepalive=args.keepalive,
             run_seconds=args.run_seconds,
+            control=args.control,
+            worker_expiry_sec=args.worker_expiry_sec,
         ).run()
     )
 

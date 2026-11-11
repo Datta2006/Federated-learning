@@ -1,9 +1,9 @@
 import { ProvenanceBanner } from "../components/ProvenanceBanner";
-import { NodeCard, NodeTopology } from "./components";
+import { NodeTopology } from "../components/NodeCard";
 import { RoundPanel } from "../components/RoundPanel";
 import { ModelBoard } from "../components/ModelBoard";
 import { ConnectionHealthCard } from "../components/ConnectionHealthCard";
-import { useOverviewStatus } from "../hooks/overview-status";
+import { useOverviewStatus } from "../hooks/useOverviewStatus";
 
 /**
  * Overview page — single landing surface for read-only operations dashboard.

@@ -22,10 +22,11 @@ export function RoundPanel({ round, source }: { round: RoundView; source: string
         {stages.map((stage) => (
           <span
             key={stage.key}
-            className={`chip px-2 py-0.5 ${
-              stage.status === "complete" ? "bg-signal-emeraldDim/40 text-signal-emerald/90"
-                : stage.status === "active" ? "bg-signal-violetDim/40 text-signal-violet/90"
-                    : "bg-ink-700 text-mist-400"`}
+            className={`chip px-2 py-0.5 ${stage.status === "complete"
+              ? "bg-signal-emeraldDim/40 text-signal-emerald/90"
+              : stage.status === "active"
+                ? "bg-signal-violetDim/40 text-signal-violet/90"
+                : "bg-ink-700 text-mist-400"}`}
           >
             <span className="inline-block h-2 w-2 rounded-full mr-1 bg-mist-500" />
             {stage.label} ({stage.status})

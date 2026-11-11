@@ -1,133 +1,165 @@
 # AirFed Dashboard
 
-Read-only operations dashboard for the **Federated PM2.5 Forecasting on IoT Nodes** project.
+Operations dashboard and local process controller for the **Federated PM2.5
+Forecasting on IoT Nodes** project.
 
-The dashboard is a separate client from the FL coordinator — it subscribes to MQTT
-events, reads the existing model registry, and never publishes commands or model
-updates. It surfaces node health, round progress, model versions, historical
-air-quality replay vs. model predictions, performance comparisons, and
-communication byte counts.
+The dashboard both **observes** the federated deployment and **controls** it:
+
+- Observes MQTT telemetry, the coordinator model registry, round history,
+  air-quality replay, and communication events.
+- Launches and stops the local Mosquitto broker, the long-lived control
+  coordinator, and arbitrary numbers of simulated workers.
+- Publishes session commands (`start`, `pause`, `resume`, `stop`) and a full
+  training configuration over MQTT.
+- Never rewrites the coordinator's model registry or fabricates round progress.
+  Round stages come from retained coordinator `round_progress` / `round_summary`
+  messages, so skipped work is displayed as `skipped`, not `complete`.
+
+Remote devices are never launched by the process manager. They connect over
+MQTT and register themselves on `{base_topic}/fl/workers/{id}/register`.
+
+## One-command local startup
+
+From the project root:
+
+```bash
+./scripts/dev.sh
+```
+
+The script builds the frontend, checks dependencies and the API port, and
+starts the FastAPI backend on `http://127.0.0.1:8010`. Then:
+
+1. Open **Workers** → **Start broker + coordinator**.
+2. Launch simulated workers (dummy or real) or start a training session from
+   **Federated** with `simulation_workers > 0`.
+
+Useful environment overrides:
+
+```bash
+AIRFED_HOST=0.0.0.0 AIRFED_PORT=8010 ./scripts/dev.sh
+AIRFED_SKIP_BUILD=1 ./scripts/dev.sh   # reuse frontend/dist
+```
 
 ## Stack
 
-- **Backend:** Python FastAPI (`backend/`), Paho MQTT observer (`backend/mqtt_observer.py`),
-  WebSocket notification channel (`/ws`), read-only endpoints over the existing
-  registry and CSV experiment files.
-- **Frontend:** React 18 + TypeScript + Vite, Tailwind CSS, Lucide icons. Five
-  hash-routed pages plus a data-source aware status bar. TypeScript source lives
-  under `frontend/src`; the package manager is npm; commands are `npm run typecheck`
-  and `npm run dev`.
+- **Backend:** Python FastAPI (`backend/`), Paho MQTT observer, WebSocket
+  channel (`/ws`), MQTT control publisher, and a subprocess manager.
+- **Frontend:** React 18 + TypeScript + Vite, Tailwind CSS, Lucide icons.
+  Six hash routes are implemented: Overview, Workers, Federated, Air Quality,
+  Performance, Communication.
 
 ## Setup
 
-Requirements: a Python 3.12 virtualenv with `paho-mqtt`, `fastapi`,
-`uvicorn[standard]`, `httpx`, `numpy`, `pandas`. TensorFlow is not required for the
-dashboard. Install the server-side dependencies first:
+Requirements: Python 3.12 virtualenv with the project dependencies plus
+`fastapi`, `uvicorn[standard]`, `httpx`, `numpy`, `pandas`, `paho-mqtt`.
+TensorFlow is only needed for real (non-dummy) simulation workers, not for the
+dashboard itself.
 
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt           # server-side deps first
-```
-
-Then install the web stack (`dashboard/requirements.txt` adds fastapi/uvicorn/httpx):
-
-```bash
+python -m pip install -r requirements.txt
 python -m pip install -r dashboard/requirements.txt
+npm --prefix dashboard/frontend install
 ```
 
-Finally install the frontend once, per machine:
+Mosquitto must be installed for the dashboard to own a local broker:
+`brew install mosquitto` (macOS) or `apt install mosquitto` (Linux). An already
+running broker on the configured host/port is used as-is.
+
+## Run
 
 ```bash
-npm install   # from the repo root, reads frontend/package.json automatically
+./scripts/dev.sh
+# or: uvicorn dashboard.backend.main:app --host 0.0.0.0 --port 8010
 ```
 
-## Run the backend
-
-From the project root, with the `.venv` activated:
+For frontend development:
 
 ```bash
-uvicorn dashboard.backend.main:app \
-    --host 0.0.0.0 --port 8010 --reload
+npm --prefix dashboard/frontend run dev   # http://localhost:5173 (proxied API)
 ```
 
-Endpoints:
+## API
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/health` | Liveness + broker state |
-| GET | `/api/status` | Node cards, current round, latest/best model |
-| GET | `/api/rounds` | Round history and loss curve |
-| GET | `/api/model` | Latest/best version, versions list, transfer size |
-| GET | `/api/metrics` | Centralized / local-only / persistence / FedAvg comparison |
-| GET | `/api/air-quality?node=<node>` | Historical replay, actual vs. predicted, temp/rh |
-| GET | `/api/communication` | MQTT events, bytes up/down, ack rates |
+| GET | `/api/health` | Liveness, broker reachability, coordinator state |
+| GET | `/api/status` | Nodes, dynamic workers, session, round, models, processes |
+| GET | `/api/rounds` | Registry round history and loss curve |
+| GET | `/api/model` | Latest/best model, versions, transfer size |
+| GET | `/api/metrics` | Stage 4 comparison and seed results |
+| GET | `/api/air-quality?node=<id>` | Historical replay, observed vs. predicted |
+| GET | `/api/communication` | MQTT events, bytes, checksums, topic contract |
+| GET | `/api/session` | Session state, current round, summaries, workers, processes |
+| GET | `/api/workers` | Dynamic worker registry and managed worker processes |
+| GET | `/api/rounds/live` | Authoritative retained round progress/summaries |
+| GET | `/api/processes` | Managed process status and crash records |
+| GET | `/api/logs?name=<process>&lines=120` | Captured stdout/stderr tail |
+| POST | `/api/control/session` | `start` / `pause` / `resume` / `stop` with config |
+| POST | `/api/workers/launch` | Launch 1–200 simulated training/inference workers |
+| POST | `/api/workers/stop` | Stop specific worker IDs or all workers |
+| POST | `/api/processes/start` | Start `broker`, `coordinator`, `stack` |
+| POST | `/api/processes/stop` | Stop one process or `all` |
 | WS | `/ws` | Live telemetry push |
-
-The dashboard serves the built frontend from `frontend/dist` if it exists;
-otherwise the SPA route falls back to the API list on `/`.
-
-## Run the frontend
-
-```bash
-npm run dev                       # http://localhost:5173  (development)
-npm run build                     # dist/, served by uvicorn
-npm run preview                   # standalone preview on :4173
-```
-
-For production, build the SPA and point uvicorn at `--reload`; the SPA talks to
-the same backend on port 8010. On an Android phone, `npm run dev` exposes the
-same ports, so both the MacBook and the phone land on the same Wi-Fi network.
 
 ## Pages
 
-1. **Overview** — five node cards with online/offline/stale status, training vs.
-   inference roles, current round, latest global model version, plus the
-   data-source banner (`live_mqtt` / `registry_only` / `unavailable`).
-2. **Federated** — live round progress, selected nodes, stage timeline
-   (client selection → local training → weight upload → update validation →
-   FedAvg aggregation → model registration), weight checksum stats, round
-   history table with acceptance columns.
-3. **Air Quality** — node selector, PM2.5 historical replay, actual vs.
-   predicted overlay, temperature & humidity series, one-hour-ahead
-   predictions. Distinguishes historical replay from any real-time sensor feed;
-   the API reports `is_realtime: false` explicitly.
-4. **Performance** — centralized / local-only / persistence / FedAvg rows
-   across raw and clipped targets, seed-wise breakdown, total bytes moved, and
-   validation loss history. No metrics are recomputed; the dashboard reads the
-   existing `results.csv`, `results_by_seed.csv`, and `stage4_summary.json`.
-5. **Communication** — MQTT topic contract, recent events with retained flag
-   and direction, per-chunk SHA-256 verdicts, accepted/rejected ack counts, and
-   bytes uploaded vs. downloaded totals.
+1. **Overview** — node/worker cards, data-source banner, current round, latest
+   and best model, broker/observer health.
+2. **Workers** — registered workers with role, shard, samples, heartbeat age,
+   state and progress; launch/stop simulated workers; stack controls; crash
+   records; process log viewer.
+3. **Federated** — full training configuration (mode, rounds, min/max workers,
+   selection policy, local epochs, deadline, window, learning rate, simulation
+   worker count), start/pause/resume/stop controls, frozen per-round selection,
+   accurate stage track, accepted/rejected updates, retained round summaries,
+   and registry round history.
+4. **Air Quality** — node selector, observed PM2.5 replay, federated
+   predictions, temperature/humidity, and explicit provenance.
+5. **Performance** — Stage 4 method comparison, seed statistics, validation
+   loss per round, latest/best model registry state.
+6. **Communication** — broker state, live round stages, model transfer
+   metadata, checksum verdicts, event stream with direction/retained flags, and
+   the topic contract.
+
+## Dynamic worker contract
+
+| Topic | Direction | Purpose |
+| --- | --- | --- |
+| `{base}/fl/control` | dashboard → coordinator | Session commands and training config |
+| `{base}/fl/session` | coordinator → dashboard | Retained session state |
+| `{base}/fl/workers/{id}/register` | worker → dashboard/coordinator | Retained self-registration and dataset/model metadata |
+| `{base}/fl/workers/{id}/state` | worker → dashboard/coordinator | Non-retained heartbeat and training state |
+| `{base}/fl/round/{n}/progress` | coordinator → dashboard | Retained stage status |
+| `{base}/fl/round/{n}/summary` | coordinator → dashboard | Retained audit record per round |
+
+A retained registration is history, not proof of life. Only fresh `state`
+heartbeats keep a worker online; old states expire after the heartbeat window.
+Inference-only workers register and show in the UI but are never selected for
+training or aggregation.
 
 ## Data provenance notes
 
 - `is_realtime: false` and `prediction_source: persistence_reference` mean the
-  widget is showing the project's existing persistence baseline as a fallback, not
-  a real-time sensor stream. Run
-  `python -m dashboard.backend.export_predictions` in the provided commands to
-  emit genuine FedAvg predictions for every node.
-- Raw PM2.5, temperature, and humidity readings never leave a node or enter the
-  MQTT payloads (privacy contract from Stage 3). The dashboard displays only
-  derived replay values.
+  widget is showing the project's existing persistence baseline as a fallback,
+  not a real-time sensor stream.
+- Raw PM2.5, temperature, and humidity readings never leave a node or enter
+  MQTT payloads. The dashboard displays only derived replay values.
+- The dashboard is a separate MQTT subscriber. It does not modify the model
+  registry; the coordinator writes all model/round artifacts.
 
 ## Tests
 
 ```bash
-python -m pytest -q tests/test_dashboard_backend.py -s
-ruff check common baselines tests node server experiments dashboard
+source .venv/bin/activate
+python -m pytest -q tests/test_dashboard_backend.py tests/test_worker_registry.py \
+  tests/test_simulation.py tests/test_process_manager.py
+python -m pytest -q tests/test_dynamic_fl.py      # real broker, dummy workers
+npm --prefix dashboard/frontend run typecheck
 ```
 
-Back-backed unit tests cover dataset parsing, registry snapshot parsing, the
-TelemetryStore ingest state machine (round lifecycle, checksum verification,
-rejected acks), metrics comparison assembly, and all six REST endpoints plus
-the WebSocket hello exchange. They skip MQTT integration entirely by driving
-TelemetryStore directly, so the suite runs without a running broker.
-
-## Configuration / workflow conventions
-
-This repository uses a small Claude Code configuration at the root,
-`CLAUDE.md`, to route skills. When a request matches an available skill, invoke it
-via the `Skill` tool (brainstorming → `/office-hours`, strategy → `/plan-ceo-review`,
-architecture review → `/plan-eng-review`, design consultation → `/design-consultation`,
-QA → `/qa`, review → `/review`, ship → `/ship`).
+The dashboard tests drive `TelemetryStore`, the worker registry, simulation
+sharding, and the process manager directly, plus REST/WebSocket endpoints. The
+dynamic integration test uses a private broker and dummy workers, so it needs
+no TensorFlow.

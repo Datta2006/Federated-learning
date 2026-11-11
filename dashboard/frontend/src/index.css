@@ -95,6 +95,14 @@
     @apply border-signal-blue/40 bg-signal-blueDim/60 text-mist-100;
   }
 
+  .btn-primary {
+    @apply border-signal-blue/50 bg-signal-blue/20 text-signal-blue hover:border-signal-blue/70 hover:bg-signal-blue/25 hover:text-mist-100;
+  }
+
+  .input {
+    @apply w-full rounded-lg border border-ink-600 bg-ink-800 px-2.5 py-1.5 text-[12px] text-mist-100 outline-none transition-colors placeholder:text-mist-600 focus:border-signal-blue/60;
+  }
+
   .data-row {
     @apply flex items-center justify-between gap-3 border-b border-ink-700/40 py-2 text-[12px] last:border-0;
   }

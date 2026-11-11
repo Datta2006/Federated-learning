@@ -47,6 +47,53 @@ export async function apiGet<T>(path: string, signal?: AbortSignal): Promise<T> 
   }
 }
 
+export async function apiPost<T>(
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 60000);
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort);
+
+  try {
+    const response = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+      try {
+        const payload = (await response.json()) as { detail?: string };
+        if (payload?.detail) detail = payload.detail;
+      } catch {
+        /* keep status text */
+      }
+      throw new ApiError(detail, response.status);
+    }
+    const text = await response.text();
+    return (text ? JSON.parse(text) : {}) as T;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new ApiError("Request timed out or was cancelled", 0);
+    }
+    throw new ApiError(
+      error instanceof Error ? error.message : "Network request failed",
+      0,
+    );
+  } finally {
+    window.clearTimeout(timeout);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 export function websocketUrl(): string {
   const explicit = import.meta.env.VITE_WS_URL as string | undefined;
   if (explicit) return explicit;

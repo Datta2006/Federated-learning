@@ -5,3 +5,9 @@ __pycache__/
 .DS_Store
 .ruff_cache/
 .stage4_runs/
+
+# Generated frontend build and live coordinator registry
+dashboard/frontend/dist/
+dashboard/frontend/node_modules/.vite/
+server/model_registry/
+.airfed_runtime/

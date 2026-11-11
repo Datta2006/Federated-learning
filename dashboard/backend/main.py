@@ -8,20 +8,25 @@ coordinator or modifies its registry.
 from __future__ import annotations
 
 import asyncio
-import json
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from common.worker_protocol import ROUND_STAGES, ProtocolError, TrainingConfig
 
 from .air_quality import AirQualityReader
+from .control import ControlError, ControlPublisher
 from .metrics import build_metrics
 from .mqtt_observer import MQTTObserver, build_observer
+from .process_manager import ProcessError, ProcessManager
 from .registry import RegistryReader
 from .settings import Settings, discover_registry
 from .telemetry import ROUND_STAGE_DEFINITIONS, TelemetryStore
@@ -79,6 +84,8 @@ class AppState:
     store: TelemetryStore
     observer: MQTTObserver
     hub: SocketHub
+    processes: ProcessManager
+    controller: ControlPublisher
     started_at: str
 
     def registry_snapshot(self) -> dict[str, Any]:
@@ -94,6 +101,27 @@ class AppState:
         if directory is not None and directory != self.registry.registry_dir:
             self.registry = RegistryReader(directory, source=source)
         return self.registry.snapshot()
+
+
+class SessionRequest(BaseModel):
+    action: Literal["start", "pause", "resume", "stop"] = "start"
+    config: dict[str, Any] | None = None
+
+
+class WorkerRequest(BaseModel):
+    count: int = Field(default=1, ge=1, le=200)
+    role: Literal["training", "inference"] = "training"
+    simulation: bool = True
+    dummy: bool = False
+    prefix: str = "sim"
+
+
+class StopWorkersRequest(BaseModel):
+    ids: list[str] | None = None
+
+
+class ProcessRequest(BaseModel):
+    name: str
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -116,6 +144,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resolved.dataset_path, resolved.predictions_path, nodes=resolved.nodes
     )
     observer = build_observer(store, resolved)
+    processes = ProcessManager(
+        host=resolved.broker_host,
+        port=resolved.broker_port,
+        base_topic=resolved.base_topic,
+    )
+    controller = ControlPublisher(
+        host=resolved.broker_host,
+        port=resolved.broker_port,
+        base_topic=resolved.base_topic,
+        qos=resolved.mqtt_qos,
+    )
     state = AppState(
         settings=resolved,
         registry=registry,
@@ -123,6 +162,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         store=store,
         observer=observer,
         hub=hub,
+        processes=processes,
+        controller=controller,
         started_at=_utc_now(),
     )
 
@@ -143,6 +184,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             task.cancel()
             observer.stop()
+            processes.stop_all()
 
     app = FastAPI(
         title="AirFed API",
@@ -154,7 +196,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
@@ -164,12 +206,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/health")
     def health() -> dict[str, Any]:
         registry = state.registry_snapshot()
+        broker = state.processes.broker_reachable()
         return {
             "ok": True,
             "time": _utc_now(),
             "uptime_since": state.started_at,
             "registry_available": registry["available"],
             "mqtt_enabled": state.settings.mqtt_enabled,
+            "broker_reachable": broker,
+            "coordinator_running": bool(
+                state.processes.status_of("coordinator")
+                and state.processes.status_of("coordinator")["running"]
+            ),
         }
 
     @app.get("/api/status")
@@ -212,6 +260,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "api_started": state.started_at,
             "mqtt_enabled": state.settings.mqtt_enabled,
             "dataset": str(state.settings.dataset_path.name),
+        }
+        payload["processes"] = state.processes.status()
+        payload["processing"] = {
+            "session": payload.get("session"),
+            "worker_counts": payload.get("worker_counts", {}),
         }
         return payload
 
@@ -301,9 +354,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         registry = state.registry_snapshot()
         selected = node or (
-            sorted(state.settings.inference_nodes)[0]
+            min(state.settings.inference_nodes)
             if state.settings.inference_nodes
-            else (sorted(state.settings.nodes)[0] if state.settings.nodes else "node5")
+            else (min(state.settings.nodes) if state.settings.nodes else "node5")
         )
         latest_version = (registry.get("latest") or {}).get("model_version")
         try:
@@ -331,7 +384,231 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "path": registry.get("registry_path"),
             "available": registry.get("available", False),
         }
+        status_payload = state.store.status_payload(registry)
+        payload["session"] = status_payload.get("session")
+        payload["round_progress"] = status_payload.get("round_progress")
+        payload["round_summaries"] = status_payload.get("round_summaries", [])
+        payload["processes"] = state.processes.status()
         return payload
+
+    # -------------------------------------------------------- dynamic control
+    def _session_snapshot() -> dict[str, Any] | None:
+        return state.store.session_snapshot()
+
+    def _ensure_stack_ready(timeout: float = 45.0) -> dict[str, Any]:
+        """Start/verify broker + coordinator and wait for a retained session."""
+        manager = state.processes
+        broker = manager.start_broker()
+        launched = manager.start_coordinator()
+        deadline = datetime.now(timezone.utc).timestamp() + timeout
+        while datetime.now(timezone.utc).timestamp() < deadline:
+            status = manager.status_of("coordinator")
+            if status is not None and not status["running"]:
+                raise ProcessError(
+                    "coordinator exited at startup: "
+                    + " | ".join(
+                        manager.logs("coordinator", lines=12)["lines"][-8:]
+                    )
+                )
+            if _session_snapshot() is not None:
+                return {"broker": broker, "coordinator": launched}
+            time.sleep(0.25)
+        raise ProcessError(
+            "coordinator did not publish a session state within "
+            f"{timeout:.0f}s; check dashboard/backend logs and the coordinator log"
+        )
+
+    def _wait_for_session(states: set[str], timeout: float = 15.0) -> dict[str, Any] | None:
+        deadline = datetime.now(timezone.utc).timestamp() + timeout
+        while datetime.now(timezone.utc).timestamp() < deadline:
+            snapshot = _session_snapshot()
+            if snapshot and snapshot.get("state") in states:
+                return snapshot
+            time.sleep(0.2)
+        return _session_snapshot()
+
+    @app.get("/api/session")
+    def session() -> dict[str, Any]:
+        registry = state.registry_snapshot()
+        payload = state.store.status_payload(registry)
+        return {
+            "available": payload.get("session") is not None,
+            "session": payload.get("session"),
+            "current_round": payload.get("current_round"),
+            "round_progress": payload.get("round_progress"),
+            "round_summaries": payload.get("round_summaries", []),
+            "workers": payload.get("workers", []),
+            "worker_counts": payload.get("worker_counts", {}),
+            "processes": state.processes.status(),
+            "stage_definition": [
+                {"key": key, "label": label} for key, label in ROUND_STAGES
+            ],
+        }
+
+    @app.get("/api/workers")
+    def workers() -> dict[str, Any]:
+        registry = state.registry_snapshot()
+        payload = state.store.status_payload(registry)
+        process_status = state.processes.status()
+        return {
+            "workers": payload.get("workers", []),
+            "counts": payload.get("worker_counts", {}),
+            "nodes": payload.get("nodes", []),
+            "processes": process_status["workers"],
+            "coordinator": process_status["coordinator"],
+            "broker": process_status["broker"],
+            "crashes": process_status["crashes"],
+        }
+
+    @app.get("/api/rounds/live")
+    def rounds_live() -> dict[str, Any]:
+        registry = state.registry_snapshot()
+        payload = state.store.status_payload(registry)
+        from common.worker_protocol import ROUND_STAGES
+
+        return {
+            "session": payload.get("session"),
+            "current_round": payload.get("current_round"),
+            "round_progress": payload.get("round_progress"),
+            "summaries": payload.get("round_summaries", []),
+            "stage_definition": [
+                {"key": key, "label": label} for key, label in ROUND_STAGES
+            ],
+        }
+
+    @app.post("/api/control/session")
+    def control_session(request: SessionRequest) -> dict[str, Any]:
+        try:
+            if request.action == "start":
+                config = TrainingConfig.from_dict(request.config)
+                readiness = (
+                    _ensure_stack_ready() if state.settings.mqtt_enabled else None
+                )
+                if config.launch_workers and config.simulation_workers > 0:
+                    state.processes.start_workers(
+                        count=config.simulation_workers,
+                        role=config.worker_role,
+                        simulation=True,
+                    )
+                state.controller.publish(
+                    "start_session", config=config.to_dict()
+                )
+                snapshot = _wait_for_session(
+                    {"waiting", "running", "paused"}, timeout=20.0
+                )
+                return {
+                    "ok": True,
+                    "command": "start_session",
+                    "config": config.to_dict(),
+                    "readiness": readiness,
+                    "session": snapshot,
+                    "processes": state.processes.status(),
+                }
+            command = f"{request.action}_session"
+            status = state.processes.status_of("coordinator")
+            if status is None or not status["running"]:
+                raise ProcessError(
+                    "coordinator is not running; start a session first"
+                )
+            state.controller.publish(command)
+            expected = {
+                "pause_session": "paused",
+                "resume_session": "running",
+                "stop_session": "stopped",
+            }[command]
+            snapshot = _wait_for_session({expected}, timeout=20.0)
+            return {
+                "ok": True,
+                "command": command,
+                "session": snapshot,
+                "processes": state.processes.status(),
+            }
+        except (ProtocolError, ProcessError, ControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/workers/launch")
+    def launch_workers(request: WorkerRequest) -> dict[str, Any]:
+        try:
+            if state.settings.mqtt_enabled:
+                _ensure_stack_ready()
+            result = state.processes.start_workers(
+                count=request.count,
+                role=request.role,
+                simulation=request.simulation,
+                dummy=request.dummy,
+                prefix=request.prefix,
+            )
+            result["processes"] = state.processes.status()
+            return result
+        except (ProcessError, ControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/workers/stop")
+    def stop_workers(request: StopWorkersRequest) -> dict[str, Any]:
+        try:
+            if request.ids:
+                stopped = [
+                    worker_id
+                    for worker_id in request.ids
+                    if state.processes.stop_worker(worker_id)
+                ]
+            else:
+                stopped = state.processes.stop_workers()
+            return {
+                "ok": True,
+                "stopped": stopped,
+                "processes": state.processes.status(),
+            }
+        except ProcessError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/processes")
+    def processes_status() -> dict[str, Any]:
+        return state.processes.status()
+
+    @app.post("/api/processes/start")
+    def start_process(request: ProcessRequest) -> dict[str, Any]:
+        try:
+            if request.name == "broker":
+                return state.processes.start_broker()
+            if request.name == "coordinator":
+                if state.settings.mqtt_enabled:
+                    state.processes.start_broker()
+                return state.processes.start_coordinator()
+            if request.name in {"stack", "all"}:
+                return _ensure_stack_ready()
+            raise ProcessError(
+                "name must be one of: broker, coordinator, stack, all"
+            )
+        except ProcessError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/processes/stop")
+    def stop_process(request: ProcessRequest) -> dict[str, Any]:
+        try:
+            if request.name in {"all", "stack"}:
+                stopped = state.processes.stop_all()
+            else:
+                stopped = (
+                    [request.name] if state.processes.stop(request.name) else []
+                )
+            return {
+                "ok": True,
+                "stopped": stopped,
+                "processes": state.processes.status(),
+            }
+        except ProcessError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/logs")
+    def logs(
+        name: str = Query(default="coordinator"),
+        lines: int = Query(default=120, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        try:
+            return state.processes.logs(name, lines=lines)
+        except ProcessError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

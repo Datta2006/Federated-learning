@@ -15,6 +15,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import math
 import re
 import threading
@@ -23,6 +24,10 @@ from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+
+from common.worker_protocol import ROUND_STAGES
+
+LOGGER = logging.getLogger(__name__)
 
 ROUND_STAGE_DEFINITIONS = [
     ("client_selection", "Client selection"),
@@ -34,7 +39,39 @@ ROUND_STAGE_DEFINITIONS = [
     ("model_registration", "Model registration"),
 ]
 
+DYNAMIC_STAGE_LABELS = dict(ROUND_STAGES)
+
 TOPIC_CONTRACT = [
+    {
+        "topic": "{base}/fl/workers/{worker}/register",
+        "direction": "up",
+        "purpose": "Retained worker identity, role, dataset shard, sample counts, model compatibility.",
+    },
+    {
+        "topic": "{base}/fl/workers/{worker}/state",
+        "direction": "up",
+        "purpose": "Live worker heartbeat with training state, round, and phase.",
+    },
+    {
+        "topic": "{base}/fl/control",
+        "direction": "down",
+        "purpose": "Dashboard start/pause/resume/stop session commands.",
+    },
+    {
+        "topic": "{base}/fl/session",
+        "direction": "down",
+        "purpose": "Retained coordinator session state and configuration.",
+    },
+    {
+        "topic": "{base}/fl/round/{r}/progress",
+        "direction": "down",
+        "purpose": "Retained authoritative per-round stage snapshot.",
+    },
+    {
+        "topic": "{base}/fl/round/{r}/summary",
+        "direction": "down",
+        "purpose": "Retained auditable round result: accepted/rejected, checksums, version.",
+    },
     {
         "topic": "{base}/{node}/status",
         "direction": "up",
@@ -199,6 +236,11 @@ class TelemetryStore:
             }
             for node_id, year in self.nodes.items()
         }
+        self._dynamic_workers: dict[str, dict[str, Any]] = {}
+        self._session: dict[str, Any] | None = None
+        self._round_progress: dict[int, dict[str, Any]] = {}
+        self._round_summaries: dict[int, dict[str, Any]] = {}
+        self._round_summary_order: deque[int] = deque(maxlen=200)
 
     # --------------------------------------------------------------- broker
     def set_broker_state(
@@ -342,7 +384,7 @@ class TelemetryStore:
             try:
                 callback(dict(event))
             except Exception:  # pragma: no cover - observer must stay alive
-                pass
+                LOGGER.debug("telemetry event callback failed", exc_info=True)
 
     def _count(self, event: dict[str, Any], size: int) -> None:
         kind = event["kind"]
@@ -378,6 +420,34 @@ class TelemetryStore:
         now: float,
     ) -> dict[str, Any] | None:
         base = re.escape(self.base_topic)
+        worker_match = re.match(
+            rf"^{base}/fl/workers/([^/]+)/(register|state)$", topic
+        )
+        if worker_match:
+            worker_id, leaf = worker_match.group(1), worker_match.group(2)
+            if leaf == "register":
+                return self._handle_worker_register(
+                    worker_id, message, retain, size, now
+                )
+            return self._handle_worker_state(
+                worker_id, message, retain, size, now
+            )
+
+        if topic == f"{self.base_topic}/fl/session":
+            return self._handle_session(message, retain, size, now)
+
+        progress_match = re.match(rf"^{base}/fl/round/(\d+)/progress$", topic)
+        if progress_match:
+            return self._handle_round_progress(
+                int(progress_match.group(1)), message, retain, size, now
+            )
+
+        summary_match = re.match(rf"^{base}/fl/round/(\d+)/summary$", topic)
+        if summary_match:
+            return self._handle_round_summary(
+                int(summary_match.group(1)), message, retain, size, now
+            )
+
         node_match = re.match(rf"^{base}/([^/]+)/(status|health)$", topic)
         if node_match:
             node_id, leaf = node_match.group(1), node_match.group(2)
@@ -496,6 +566,240 @@ class TelemetryStore:
                 status=event_status,
             ),
             "direction": "up",
+        }
+
+    # ------------------------------------------------------ dynamic workers
+    def _worker_entry(self, worker_id: str) -> dict[str, Any]:
+        return self._dynamic_workers.setdefault(
+            worker_id,
+            {
+                "id": worker_id,
+                "role": "training",
+                "dataset": "unknown",
+                "shard_index": None,
+                "shard_count": None,
+                "n_samples": 0,
+                "n_val": 0,
+                "model": {},
+                "capabilities": {},
+                "state": None,
+                "registered_at": None,
+                "last_seen": None,
+                "current_round": None,
+                "progress": None,
+                "phase": None,
+                "detail": None,
+                "update_status": None,
+                "model_version": None,
+                "registration_count": 0,
+            },
+        )
+
+    def _handle_worker_register(
+        self,
+        worker_id: str,
+        message: dict[str, Any],
+        retain: bool,
+        size: int,
+        now: float,
+    ) -> dict[str, Any]:
+        entry = self._worker_entry(worker_id)
+        entry["role"] = (
+            message.get("role")
+            if message.get("role") in {"training", "inference"}
+            else entry["role"]
+        )
+        entry["dataset"] = str(message.get("dataset") or "unknown")
+        entry["shard_index"] = _safe_int(message.get("shard_index"))
+        entry["shard_count"] = _safe_int(message.get("shard_count"))
+        entry["n_samples"] = _safe_int(message.get("n_samples")) or 0
+        entry["n_val"] = _safe_int(message.get("n_val")) or 0
+        entry["model"] = (
+            dict(message.get("model") or {})
+            if isinstance(message.get("model"), dict)
+            else {}
+        )
+        entry["capabilities"] = (
+            dict(message.get("capabilities") or {})
+            if isinstance(message.get("capabilities"), dict)
+            else {}
+        )
+        entry["registration_count"] += 1
+        registered = _parse_iso(message.get("ts"))
+        if registered is not None:
+            entry["registered_at"] = registered
+        # A retained registration is history, not proof of life.  Only a live
+        # state heartbeat may mark this worker online.
+        if not retain:
+            entry["last_seen"] = now
+        detail = (
+            f"Worker {worker_id} registered as {entry['role']} "
+            f"({entry['dataset']}, {entry['n_samples']:,} samples)"
+        )
+        return {
+            **self._base_event(
+                f"{self.base_topic}/fl/workers/{worker_id}/register",
+                "worker_register",
+                retain,
+                size,
+                now,
+                detail=detail,
+                node_id=worker_id,
+                status="accepted",
+            ),
+            "direction": "up",
+        }
+
+    def _handle_worker_state(
+        self,
+        worker_id: str,
+        message: dict[str, Any],
+        retain: bool,
+        size: int,
+        now: float,
+    ) -> dict[str, Any]:
+        entry = self._worker_entry(worker_id)
+        state = message.get("state")
+        if isinstance(state, str):
+            entry["state"] = state
+        event_ts = _parse_iso(message.get("ts"))
+        # Retained states carry their original timestamp; an old heartbeat must
+        # expire rather than appear fresh just because it was replayed.
+        entry["last_seen"] = event_ts if event_ts is not None else (None if retain else now)
+        entry["current_round"] = _safe_int(message.get("current_round"))
+        entry["progress"] = _safe_float(message.get("progress"))
+        entry["phase"] = message.get("phase")
+        entry["detail"] = message.get("detail")
+        entry["update_status"] = message.get("update_status")
+        entry["model_version"] = message.get("model_version")
+        detail = f"Worker {worker_id} state={entry['state'] or 'unknown'}"
+        if entry.get("current_round") is not None:
+            detail += f" · round {entry['current_round']}"
+        return {
+            **self._base_event(
+                f"{self.base_topic}/fl/workers/{worker_id}/state",
+                "worker_state",
+                retain,
+                size,
+                now,
+                detail=detail,
+                node_id=worker_id,
+                round_number=entry.get("current_round"),
+                status="accepted" if entry.get("state") != "error" else "rejected",
+            ),
+            "direction": "up",
+        }
+
+    def _handle_session(
+        self,
+        message: dict[str, Any],
+        retain: bool,
+        size: int,
+        now: float,
+    ) -> dict[str, Any]:
+        state = message.get("state")
+        self._session = {
+            "session_id": message.get("session_id"),
+            "state": state,
+            "config": message.get("config") if isinstance(message.get("config"), dict) else None,
+            "round": _safe_int(message.get("round")),
+            "completed_rounds": _safe_int(message.get("completed_rounds")) or 0,
+            "message": message.get("message"),
+            "latest_model_version": message.get("latest_model_version"),
+            "updated_utc": message.get("updated_utc") or message.get("ts"),
+            "retained": retain,
+            "observed_at": now,
+        }
+        detail = f"Session {self._session['session_id'] or '—'}: {state or 'unknown'}"
+        if self._session.get("message"):
+            detail += f" · {self._session['message']}"
+        return {
+            **self._base_event(
+                f"{self.base_topic}/fl/session",
+                "session",
+                retain,
+                size,
+                now,
+                detail=detail,
+                status="accepted",
+                round_number=self._session.get("round"),
+                model_version=self._session.get("latest_model_version"),
+            ),
+            "direction": "down",
+        }
+
+    def _handle_round_progress(
+        self,
+        round_number: int,
+        message: dict[str, Any],
+        retain: bool,
+        size: int,
+        now: float,
+    ) -> dict[str, Any]:
+        stages = message.get("stages")
+        self._round_progress[round_number] = {
+            **message,
+            "round": round_number,
+            "stages": dict(stages) if isinstance(stages, dict) else {},
+            "observed_at": now,
+            "retained": retain,
+        }
+        detail = (
+            f"Round {round_number} stage={message.get('stage')} "
+            f"status={message.get('status')}"
+        )
+        return {
+            **self._base_event(
+                f"{self.base_topic}/fl/round/{round_number}/progress",
+                "round_progress",
+                retain,
+                size,
+                now,
+                detail=detail,
+                round_number=round_number,
+                model_version=message.get("model_version"),
+                status=str(message.get("status") or ""),
+            ),
+            "direction": "down",
+        }
+
+    def _handle_round_summary(
+        self,
+        round_number: int,
+        message: dict[str, Any],
+        retain: bool,
+        size: int,
+        now: float,
+    ) -> dict[str, Any]:
+        self._round_summaries[round_number] = {
+            **message,
+            "round": round_number,
+            "observed_at": now,
+            "retained": retain,
+        }
+        if round_number not in self._round_summary_order:
+            self._round_summary_order.append(round_number)
+        while len(self._round_summaries) > 200:
+            oldest = self._round_summary_order.popleft()
+            self._round_summaries.pop(oldest, None)
+        detail = (
+            f"Round {round_number} summary: {message.get('status')} "
+            f"({len(message.get('accepted') or [])} accepted, "
+            f"{len(message.get('rejected') or {})} rejected)"
+        )
+        return {
+            **self._base_event(
+                f"{self.base_topic}/fl/round/{round_number}/summary",
+                "round_summary",
+                retain,
+                size,
+                now,
+                detail=detail,
+                round_number=round_number,
+                model_version=message.get("model_version"),
+                status=str(message.get("status") or ""),
+            ),
+            "direction": "down",
         }
 
     # -------------------------------------------------------------- global
@@ -767,6 +1071,159 @@ class TelemetryStore:
         }
 
     # -------------------------------------------------------------- status
+    def _dynamic_worker_view(self, entry: dict[str, Any], now: float) -> dict[str, Any]:
+        last_seen = entry.get("last_seen")
+        age = None if last_seen is None else max(0.0, now - float(last_seen))
+        online = (
+            age is not None
+            and age <= self.stale_after_sec
+            and entry.get("state") not in {"offline"}
+        )
+        state = entry.get("state")
+        if state is None:
+            status = "unknown"
+        elif state == "offline":
+            status = "offline"
+        elif online:
+            status = "online"
+        else:
+            status = "stale"
+        selectable = bool(
+            online
+            and entry.get("role") == "training"
+            and state not in {"paused", "error", "offline"}
+        )
+        return {
+            **entry,
+            "worker_id": entry["id"],
+            "online": online,
+            "connection": "online" if online else "offline",
+            "status": status,
+            "selectable": selectable,
+            "last_seen_age_sec": None if age is None else round(age, 1),
+            "last_seen": _iso(last_seen),
+            "registered_at": _iso(entry.get("registered_at")),
+        }
+
+    def _worker_counts(self, views: list[dict[str, Any]]) -> dict[str, int]:
+        return {
+            "total": len(views),
+            "online": sum(1 for item in views if item["online"]),
+            "offline": sum(1 for item in views if not item["online"]),
+            "training": sum(
+                1 for item in views if item["role"] == "training" and item["online"]
+            ),
+            "inference": sum(
+                1 for item in views if item["role"] == "inference" and item["online"]
+            ),
+            "available": sum(1 for item in views if item["selectable"]),
+            "busy": sum(
+                1
+                for item in views
+                if item["online"] and item.get("state") in {"training", "uploading"}
+            ),
+        }
+
+    def _authoritative_round_view(self, now: float) -> dict[str, Any] | None:
+        """Round view assembled from coordinator progress/summary messages."""
+        if not self._round_progress and not self._round_summaries:
+            return None
+        session_round = (self._session or {}).get("round")
+        if session_round in self._round_progress or session_round in self._round_summaries:
+            round_number = int(session_round)
+        elif self._round_summaries:
+            round_number = max(self._round_summaries)
+        else:
+            round_number = max(self._round_progress)
+        progress = self._round_progress.get(round_number)
+        summary = self._round_summaries.get(round_number)
+        if progress is None and summary is None:
+            return None
+        source = summary or progress or {}
+        stage_map = dict((progress or {}).get("stages") or {})
+        summary_completed = bool(summary and summary.get("aggregated"))
+        stages: list[dict[str, str]] = []
+        for key, label in ROUND_STAGES:
+            status = stage_map.get(key)
+            if status is None:
+                if summary is None:
+                    status = "pending"
+                elif key in {"waiting_for_workers", "client_selection", "model_distribution"}:
+                    status = "complete"
+                elif key in {"local_training", "update_upload", "update_validation"}:
+                    status = "complete" if source.get("accepted") else "skipped"
+                elif key in {"aggregation", "model_registration"}:
+                    status = "complete" if summary_completed else "skipped"
+                else:
+                    status = "pending"
+            if summary is not None:
+                # A summary is the final word for stages the coordinator did
+                # not explicitly mark.  Work that never ran must never be
+                # presented as complete, and completed aggregation must not
+                # stay pending because the last progress snapshot predates it.
+                if key in {
+                    "local_training",
+                    "update_upload",
+                    "update_validation",
+                } and not source.get("accepted") and status in {"pending", "active"}:
+                    status = "skipped"
+                if key in {"aggregation", "model_registration"}:
+                    if not summary_completed and status in {"pending", "active"}:
+                        status = "skipped"
+                    elif summary_completed and status in {"pending", "active"}:
+                        status = "complete"
+            stages.append({"key": key, "label": label, "status": status})
+        accepted = list(source.get("accepted") or [])
+        rejected = source.get("rejected")
+        rejected_map = dict(rejected) if isinstance(rejected, dict) else {}
+        selected = [str(item) for item in (source.get("selected") or [])]
+        observed = float((progress or summary or {}).get("observed_at") or now)
+        status = str(source.get("status") or "unknown")
+        is_live = bool(
+            self._broker["connected"]
+            and summary is None
+            and status == "active"
+            and now - observed <= self.round_stale_after_sec
+            and (self._session or {}).get("state") in {"running", "waiting"}
+        )
+        return {
+            "round": round_number,
+            "model_version": source.get("model_version"),
+            "evaluated_version": source.get("evaluated_version"),
+            "selected": selected,
+            "received": len(accepted),
+            "upload_nodes": accepted,
+            "acks": {
+                **{node: "accepted" for node in accepted},
+                **{node: "rejected" for node in rejected_map},
+            },
+            "accepted": accepted,
+            "rejected": sorted(rejected_map),
+            "reasons": rejected_map,
+            "checksums": dict(source.get("checksums") or {}),
+            "registered_version": source.get("model_version") if summary_completed else None,
+            "single_client": bool(source.get("single_client")),
+            "aggregated": bool(source.get("aggregated")),
+            "status": status,
+            "started_at": _iso(observed),
+            "last_event_at": _iso(observed),
+            "bytes_up": int(source.get("bytes_up") or 0),
+            "bytes_down": int(source.get("bytes_down") or 0),
+            "weighted_val_loss": _safe_float(source.get("weighted_val_loss")),
+            "phase": status,
+            "phase_label": {
+                "completed": "Model registered",
+                "failed": "Round failed",
+                "insufficient_updates": "Insufficient valid updates",
+                "stopped": "Stopped",
+                "active": str(source.get("stage") or "in progress"),
+            }.get(status, status),
+            "is_live": is_live,
+            "idle_seconds": round(max(0.0, now - observed), 1),
+            "stages": stages,
+            "source": "coordinator",
+        }
+
     def _node_view(self, node_id: str, now: float) -> dict[str, Any]:
         state = self._nodes_state[node_id]
         observed = state.get("status_at")
@@ -917,7 +1374,35 @@ class TelemetryStore:
         now = time.time() if now is None else now
         with self._lock:
             nodes = [self._node_view(node_id, now) for node_id in self.nodes]
+            worker_views = [
+                self._dynamic_worker_view(entry, now)
+                for entry in sorted(
+                    self._dynamic_workers.values(), key=lambda item: item["id"]
+                )
+            ]
+            worker_counts = self._worker_counts(worker_views)
+            known_nodes = set(self.nodes)
+            for worker in worker_views:
+                if worker["id"] in known_nodes:
+                    continue
+                nodes.append(
+                    {
+                        "id": worker["id"],
+                        "year": None,
+                        "role": worker["role"],
+                        "status": worker["status"],
+                        "reported_state": worker.get("state"),
+                        "reason": worker.get("detail"),
+                        "last_seen": worker.get("last_seen"),
+                        "last_health": worker.get("last_seen"),
+                        "message_ts": None,
+                        "retained": False,
+                        "source": "mqtt",
+                        "worker": worker,
+                    }
+                )
             live_round = self._round_view(now)
+            authoritative_round = self._authoritative_round_view(now)
             latest = registry.get("latest") or {}
             historical_round = None
             rounds = registry.get("rounds") or []
@@ -951,7 +1436,6 @@ class TelemetryStore:
                     "source": "registry",
                 }
 
-            stale_round = bool(live_round) and not live_round.get("is_live")
             return {
                 "server_time": _iso(now),
                 "data_source": (
@@ -975,9 +1459,24 @@ class TelemetryStore:
                     "round_stale_after_sec": self.round_stale_after_sec,
                 },
                 "nodes": nodes,
-                "current_round": live_round or historical_round,
-                "round_is_live": bool(live_round and live_round.get("is_live")),
-                "round_is_stale": stale_round,
+                "workers": worker_views,
+                "worker_counts": worker_counts,
+                "session": dict(self._session) if self._session else None,
+                "round_progress": authoritative_round,
+                "round_summaries": [
+                    dict(self._round_summaries[number])
+                    for number in list(self._round_summary_order)[-50:]
+                    if number in self._round_summaries
+                ],
+                "current_round": authoritative_round or live_round or historical_round,
+                "round_is_live": bool(
+                    (authoritative_round or {}).get("is_live")
+                    or (live_round and live_round.get("is_live"))
+                ),
+                "round_is_stale": bool(
+                    (authoritative_round and not authoritative_round.get("is_live"))
+                    or (live_round and not live_round.get("is_live"))
+                ),
                 "latest_model": latest,
                 "registry": {
                     "available": registry.get("available", False),
@@ -998,6 +1497,10 @@ class TelemetryStore:
     def events(self, limit: int = 120) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(event) for event in list(self._events)[-limit:][::-1]]
+
+    def session_snapshot(self) -> dict[str, Any] | None:
+        with self._lock:
+            return dict(self._session) if self._session else None
 
     def communication_payload(
         self,
@@ -1058,7 +1561,11 @@ class TelemetryStore:
                     {
                         **item,
                         "topic": item["topic"].format(
-                            base=self.base_topic, node="{node}", r="{r}", i="{i}"
+                            base=self.base_topic,
+                            node="{node}",
+                            worker="{worker}",
+                            r="{r}",
+                            i="{i}",
                         ),
                     }
                     for item in TOPIC_CONTRACT
