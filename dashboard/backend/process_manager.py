@@ -103,6 +103,7 @@ class ProcessManager:
         self.coordinator_args = list(coordinator_args or [])
         self._lock = threading.RLock()
         self._processes: dict[str, ManagedProcess] = {}
+        self._adopted: dict[str, dict[str, Any]] = {}
         self._crashes: list[dict[str, Any]] = []
         self._broker_owned = False
         self._shutdown = False
@@ -144,11 +145,40 @@ class ProcessManager:
 
     def _record_started(self, process: ManagedProcess) -> None:
         self._processes[process.name] = process
+        self._adopted.pop(process.name, None)
         self._pid_path(process.name).write_text(
             str(process.popen.pid), encoding="utf-8"
         )
 
+    def _adopt(
+        self, name: str, kind: str, pid: int, role: str | None = None
+    ) -> dict[str, Any]:
+        """Track a process launched outside the dashboard without owning it."""
+        info = {
+            "name": name,
+            "kind": kind,
+            "role": role,
+            "pid": pid,
+            "running": self._pid_alive(pid),
+            "exit_code": None,
+            "started_at": None,
+            "uptime_sec": None,
+            "command": [],
+            "log_path": str(self._log_path(name)),
+            "external": True,
+            "adopted": True,
+        }
+        self._adopted[name] = info
+        return info
+
     def _cleanup_dead(self) -> None:
+        for name, info in list(self._adopted.items()):
+            if not self._pid_alive(int(info["pid"])):
+                self._adopted.pop(name, None)
+                try:
+                    self._pid_path(name).unlink()
+                except OSError:
+                    pass
         for name, process in list(self._processes.items()):
             if process.alive():
                 continue
@@ -299,6 +329,17 @@ class ProcessManager:
                     "message": f"coordinator already running as PID {existing.popen.pid}",
                     "process": existing.to_dict(),
                 }
+            external = self._external_pid("coordinator")
+            if external is not None:
+                info = self._adopt("coordinator", "coordinator", external)
+                return {
+                    "ok": True,
+                    "adopted": True,
+                    "message": (
+                        f"adopted externally started coordinator PID {external}"
+                    ),
+                    "process": info,
+                }
             if not self.broker_reachable():
                 raise ProcessError(
                     "broker is not reachable; start the broker before the coordinator"
@@ -358,6 +399,11 @@ class ProcessManager:
                 worker_id = f"{prefix}-{index + 1}"
                 existing = self._processes.get(worker_id)
                 if existing is not None and existing.alive():
+                    skipped.append(worker_id)
+                    continue
+                external = self._external_pid(worker_id)
+                if external is not None:
+                    self._adopt(worker_id, "worker", external, role=role)
                     skipped.append(worker_id)
                     continue
                 command = [
@@ -424,6 +470,11 @@ class ProcessManager:
                 for name, process in self._processes.items()
                 if process.kind == "worker" and process.alive()
             ]
+            names.extend(
+                name
+                for name, info in self._adopted.items()
+                if info["kind"] == "worker" and info["running"]
+            )
         for name in names:
             self.stop(name, timeout=timeout)
         return names
@@ -431,6 +482,26 @@ class ProcessManager:
     # ------------------------------------------------------------------ stop
     def stop(self, name: str, *, timeout: float = 10.0) -> bool:
         with self._lock:
+            adopted = self._adopted.pop(name, None)
+            if adopted is not None:
+                pid = int(adopted["pid"])
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                deadline = time.time() + timeout
+                while time.time() < deadline and self._pid_alive(pid):
+                    time.sleep(0.1)
+                if self._pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                try:
+                    self._pid_path(name).unlink()
+                except OSError:
+                    pass
+                return True
             process = self._processes.get(name)
             if process is None or process.popen.poll() is not None:
                 self._cleanup_dead()
@@ -489,7 +560,13 @@ class ProcessManager:
     def status_of(self, name: str) -> dict[str, Any] | None:
         with self._lock:
             process = self._processes.get(name)
-            return process.to_dict() if process is not None else None
+            if process is not None:
+                return process.to_dict()
+            adopted = self._adopted.get(name)
+            if adopted is not None:
+                adopted["running"] = self._pid_alive(int(adopted["pid"]))
+                return dict(adopted)
+            return None
 
     def logs(self, name: str, *, lines: int = 120) -> dict[str, Any]:
         process = self._processes.get(name)
@@ -507,6 +584,12 @@ class ProcessManager:
         with self._lock:
             self._cleanup_dead()
             processes = [process.to_dict() for process in self._processes.values()]
+            managed = {item["name"] for item in processes}
+            processes.extend(
+                dict(info)
+                for name, info in self._adopted.items()
+                if name not in managed
+            )
             crashes = list(self._crashes)
         return {
             "broker": {

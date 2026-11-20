@@ -1,252 +1,192 @@
-import { useMemo, useState } from "react";
-import { ArrowDownLeft, ArrowUpRight, RefreshCw, ShieldCheck, Waves } from "lucide-react";
+import { Activity, ArrowDown, ArrowUp, Radio, ScrollText } from "lucide-react";
 import { useApi } from "../lib/useApi";
-import { useLiveFeed } from "../hooks/useLiveFeed";
-import { formatBytes, formatInteger, formatTime, relativeTime } from "../lib/format";
 import type { CommunicationPayload } from "../types";
 import {
   Badge,
+  DataRow,
+  Dot,
   EmptyState,
-  ErrorState,
-  Kpi,
-  PageSkeleton,
+  Metric,
   Panel,
-  PanelHeader,
-  StatusBadge,
-  SummaryRow,
+  PanelHead,
+  PageTitle,
+  Sparkline,
 } from "../components/ui";
-import { StageTrack } from "../components/StageTrack";
+import { formatBytes, formatInteger, formatTime, relativeTime } from "../lib/format";
 
 export function CommunicationPage() {
-  const { data, error, loading, refresh } = useApi<CommunicationPayload>(
-    "/api/communication?limit=150",
-    2500,
-  );
-  const { status: socketStatus, revision } = useLiveFeed();
-  const [filter, setFilter] = useState<"all" | "up" | "down">("all");
-
-  const events = useMemo(() => {
-    if (!data) return [];
-    if (filter === "all") return data.events;
-    return data.events.filter((event) => event.direction === filter);
-  }, [data, filter]);
-
-  if (loading && !data) {
-    return (
-      <div className="mx-auto max-w-6xl px-4 pb-10 pt-5">
-        <PageSkeleton rows={2} />
-      </div>
-    );
-  }
-  if (error && !data) {
-    return (
-      <div className="mx-auto max-w-6xl px-4 pb-10 pt-5">
-        <ErrorState message={error} onRetry={refresh} />
-      </div>
-    );
-  }
-  if (!data) return null;
-
-  const observed = data.observed;
-  const checksumTotal = observed.checksum_ok + observed.checksum_bad;
+  const { data, error } = useApi<CommunicationPayload>("/api/communication?limit=150", 4000);
+  const observed = data?.observed;
+  const events = data?.events ?? [];
+  const history = data?.history ?? [];
 
   return (
-    <div className="mx-auto max-w-6xl space-y-4 px-4 pb-10 pt-5">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <StatusBadge
-            status={data.broker.connected ? "online" : "offline"}
-            label={data.broker.connected ? "MQTT connected" : "MQTT disconnected"}
-          />
-          <Badge tone="mist">
-            {data.broker.host}:{data.broker.port}
+    <div className="space-y-5">
+      <PageTitle
+        title="Communication"
+        description="What the dashboard's own MQTT subscriber observed: bytes, chunks, checksum verdicts, and acknowledgements. Chunk bodies are verified and discarded."
+        meta={
+          <Badge tone={data?.broker.connected ? "ok" : "bad"}>
+            <Dot tone={data?.broker.connected ? "ok" : "bad"} pulse={data?.broker.connected} />
+            {data?.broker.connected ? "broker connected" : "broker unreachable"}
           </Badge>
-          <Badge tone="blue">websocket {socketStatus}</Badge>
-          {data.broker.last_error ? <Badge tone="red">{data.broker.last_error}</Badge> : null}
-        </div>
-        <div className="flex items-center gap-2 text-[11px] text-mist-500">
-          <span>last message {relativeTime(data.broker.last_message_at)}</span>
-          <button type="button" className="btn" onClick={refresh}>
-            <RefreshCw size={13} /> Refresh
-          </button>
-        </div>
-      </div>
+        }
+      />
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Kpi label="Messages observed" value={formatInteger(observed.messages)} icon={<Waves size={15} />} tone="blue" hint={`${observed.chunks} chunks · ${formatBytes(observed.chunk_bytes)}`} />
-        <Kpi label="Bytes up" value={formatBytes(observed.bytes_up)} icon={<ArrowUpRight size={15} />} tone="violet" hint="worker → coordinator" />
-        <Kpi label="Bytes down" value={formatBytes(observed.bytes_down)} icon={<ArrowDownLeft size={15} />} tone="emerald" hint="coordinator → worker" />
-        <Kpi
-          label="Checksums"
-          value={checksumTotal === 0 ? "—" : `${observed.checksum_ok}/${checksumTotal}`}
-          icon={<ShieldCheck size={15} />}
-          tone={observed.checksum_bad > 0 ? "red" : "emerald"}
-          hint={`${observed.acks_accepted} accepted acks · ${observed.acks_rejected} rejected`}
+      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-panel border border-line bg-line lg:grid-cols-5">
+        <Metric label="Messages observed" value={formatInteger(observed?.messages)} />
+        <Metric
+          label="Up"
+          value={formatBytes(observed?.bytes_up)}
+          hint="worker → coordinator"
+          tone="info"
+        />
+        <Metric
+          label="Down"
+          value={formatBytes(observed?.bytes_down)}
+          hint="coordinator → workers"
+          tone="accent"
+        />
+        <Metric
+          label="Chunks"
+          value={formatInteger(observed?.chunks)}
+          hint={`${formatBytes(observed?.chunk_bytes)} verified`}
+        />
+        <Metric
+          label="Acks"
+          value={`${observed?.acks_accepted ?? 0} / ${observed?.acks_rejected ?? 0}`}
+          hint="accepted / rejected"
+          tone={observed?.acks_rejected ? "bad" : "ok"}
         />
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        <Panel>
-          <PanelHeader
-            title="Live round"
-            subtitle={data.live_round ? `Round ${data.live_round.round} · ${data.live_round.is_live ? "live" : "inactive"}` : "No live round observed."}
-            icon={<Waves size={15} />}
+      <div className="grid gap-4 xl:grid-cols-3">
+        <Panel className="xl:col-span-2">
+          <PanelHead
+            title="Observed traffic"
+            subtitle="Newest first. Retained replays are deduplicated."
+            icon={<Radio size={14} />}
           />
-          <div className="px-5 pb-5 pt-3">
-            {!data.live_round ? (
-              <EmptyState title="No live round" message="Start a federated session; round progress and acks stream here as retained MQTT telemetry." />
-            ) : (
-              <div className="space-y-3">
-                <StageTrack stages={data.live_round.stages ?? []} />
-                <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
-                  <SummaryRow label="selected" value={formatInteger(data.live_round.selected.length)} />
-                  <SummaryRow label="received" value={formatInteger(data.live_round.received)} />
-                  <SummaryRow label="bytes up" value={formatBytes(data.live_round.bytes_up)} />
-                  <SummaryRow label="bytes down" value={formatBytes(data.live_round.bytes_down)} />
-                </div>
-              </div>
-            )}
-          </div>
-        </Panel>
-
-        <Panel>
-          <PanelHeader
-            title="Model transfer"
-            subtitle="The float32 weight vector remains the only model-update path."
-            icon={<ShieldCheck size={15} />}
-          />
-          <div className="grid gap-2.5 px-5 pb-5 pt-3 sm:grid-cols-2">
-            <SummaryRow label="model version" value={data.model_transfer.model_version ?? "—"} />
-            <SummaryRow label="parameters" value={formatInteger(data.model_transfer.parameters)} />
-            <SummaryRow label="transfer bytes" value={formatBytes(data.model_transfer.bytes)} />
-            <SummaryRow label="chunk size" value={formatBytes(data.model_transfer.chunk_size)} />
-            <SummaryRow label="chunks" value={formatInteger(data.model_transfer.chunks)} />
-            <SummaryRow label="source" value={data.model_transfer.source} />
-          </div>
-          {data.last_model_announce ? (
-            <div className="border-t border-ink-700/60 px-5 py-3 text-[11px] text-mist-500">
-              <div className="label">last announce</div>
-              <div className="mono mt-1 text-mist-200">{data.last_model_announce.model_version ?? "—"}</div>
-              <div className="mt-1">
-                round {data.last_model_announce.federated_round ?? "—"} · {formatInteger(data.last_model_announce.chunks)} chunks ·{" "}
-                {formatBytes(data.last_model_announce.size)} · at {formatTime(data.last_model_announce.at)}
-              </div>
-            </div>
-          ) : null}
-        </Panel>
-      </div>
-
-      <Panel className="overflow-hidden">
-        <PanelHeader
-          title="Event stream"
-          subtitle={`Observed MQTT traffic · revision ${revision} · retained messages are marked`}
-          icon={<Waves size={15} />}
-          action={
-            <select className="input w-auto py-1" value={filter} onChange={(event) => setFilter(event.target.value as typeof filter)}>
-              <option value="all">all directions</option>
-              <option value="up">worker → coordinator</option>
-              <option value="down">coordinator → worker</option>
-            </select>
-          }
-        />
-        {events.length === 0 ? (
-          <EmptyState title="No events" message="Start the broker, coordinator, and workers to observe MQTT traffic. Nothing here is synthesized." />
-        ) : (
-          <div className="max-h-[520px] overflow-auto">
-            <table className="w-full text-left text-[11px]">
-              <thead className="sticky top-0 border-y border-ink-700/70 bg-ink-850 text-mist-500">
-                <tr>
-                  <th className="px-4 py-2 font-medium">time</th>
-                  <th className="px-3 py-2 font-medium">dir</th>
-                  <th className="px-3 py-2 font-medium">kind</th>
-                  <th className="px-3 py-2 font-medium">node</th>
-                  <th className="px-3 py-2 font-medium">round</th>
-                  <th className="px-3 py-2 font-medium">status</th>
-                  <th className="px-3 py-2 font-medium">size</th>
-                  <th className="px-3 py-2 font-medium">checksum</th>
-                  <th className="px-3 py-2 font-medium">detail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {events.map((event) => (
-                  <tr key={event.id} className="border-b border-ink-700/40 last:border-0">
-                    <td className="px-4 py-2 mono whitespace-nowrap text-mist-400">{formatTime(event.at)}</td>
-                    <td className="px-3 py-2">
-                      {event.direction === "up" ? (
-                        <span className="inline-flex items-center gap-1 text-signal-violet"><ArrowUpRight size={12} />up</span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 text-signal-emerald"><ArrowDownLeft size={12} />down</span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 text-mist-200">{event.kind}</td>
-                    <td className="px-3 py-2 mono text-mist-300">{event.node_id ?? "—"}</td>
-                    <td className="px-3 py-2 mono text-mist-300">{event.round ?? "—"}</td>
-                    <td className="px-3 py-2">
-                      {event.status ? <Badge tone={event.status === "accepted" || event.status === "completed" ? "emerald" : event.status === "rejected" || event.status === "failed" ? "red" : "mist"}>{event.status}</Badge> : <span className="text-mist-500">—</span>}
-                    </td>
-                    <td className="px-3 py-2 mono text-mist-300">{formatBytes(event.size_bytes)}</td>
-                    <td className="px-3 py-2">
-                      {event.checksum_ok === null ? (
-                        <span className="text-mist-500">—</span>
-                      ) : (
-                        <Badge tone={event.checksum_ok ? "emerald" : "red"}>
-                          {event.checksum_ok ? "ok" : "bad"}
-                        </Badge>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 text-mist-400">
-                      {event.detail}
-                      {event.retained ? <span className="ml-1 text-[9px] uppercase text-mist-600">retained</span> : null}
-                    </td>
+          {events.length === 0 ? (
+            <EmptyState
+              icon={<Activity size={15} />}
+              title="No messages observed yet"
+              message="Start the broker and a session. The observer only counts traffic it actually received since connecting."
+            />
+          ) : (
+            <div className="max-h-[460px] overflow-auto">
+              <table className="w-full border-collapse text-[11px]">
+                <thead className="sticky top-0 bg-panel">
+                  <tr className="border-b border-line text-left text-2xs uppercase tracking-wide text-ink-600">
+                    <th className="px-4 py-2 font-medium">Time</th>
+                    <th className="px-4 py-2 font-medium">Dir</th>
+                    <th className="px-4 py-2 font-medium">Kind</th>
+                    <th className="px-4 py-2 font-medium">Node</th>
+                    <th className="px-4 py-2 text-right font-medium">Bytes</th>
+                    <th className="px-4 py-2 font-medium">Detail</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Panel>
-
-      <Panel>
-        <PanelHeader
-          title="Topic contract"
-          subtitle="MQTT topics used by the dynamic worker/coordinator protocol."
-          icon={<Waves size={15} />}
-        />
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-[11px]">
-            <thead className="border-y border-ink-700/70 bg-ink-800/40 text-mist-500">
-              <tr>
-                <th className="px-4 py-2 font-medium">topic</th>
-                <th className="px-3 py-2 font-medium">direction</th>
-                <th className="px-3 py-2 font-medium">purpose</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.topic_contract.map((item) => (
-                <tr key={item.topic} className="border-b border-ink-700/40 last:border-0">
-                  <td className="px-4 py-2 mono text-mist-200">{item.topic}</td>
-                  <td className="px-3 py-2">
-                    <Badge tone={item.direction === "up" ? "violet" : "emerald"}>{item.direction}</Badge>
-                  </td>
-                  <td className="px-3 py-2 text-mist-400">{item.purpose}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        {data.acks.rejected_events.length > 0 ? (
-          <div className="border-t border-ink-700/60 px-5 py-3">
-            <div className="label mb-1">recent rejected updates</div>
-            <div className="flex flex-wrap gap-1.5">
-              {data.acks.rejected_events.map((event) => (
-                <Badge key={event.id} tone="red">
-                  {event.node_id ?? "?"} · r{event.round ?? "?"} · {event.detail}
-                </Badge>
-              ))}
+                </thead>
+                <tbody>
+                  {events.map((event) => (
+                    <tr key={event.id} className="border-b border-line/60 last:border-0">
+                      <td className="mono px-4 py-1.5 text-ink-600">{formatTime(event.at)}</td>
+                      <td className="px-4 py-1.5">
+                        {event.direction === "up" ? (
+                          <ArrowUp size={12} className="text-info" />
+                        ) : event.direction === "down" ? (
+                          <ArrowDown size={12} className="text-accent" />
+                        ) : (
+                          <span className="text-ink-600">—</span>
+                        )}
+                      </td>
+                      <td className="mono px-4 py-1.5 text-ink-300">{event.kind}</td>
+                      <td className="mono whitespace-nowrap px-4 py-1.5 text-ink-400">{event.node_id ?? "—"}</td>
+                      <td className="mono px-4 py-1.5 text-right text-ink-500">
+                        {formatInteger(event.size_bytes)}
+                      </td>
+                      <td className="px-4 py-1.5 text-ink-400">
+                        {event.detail}
+                        {event.checksum_ok === false ? (
+                          <Badge tone="bad" className="ml-2">checksum mismatch</Badge>
+                        ) : null}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
+          )}
+        </Panel>
+
+        <div className="space-y-4">
+          <Panel>
+            <PanelHead title="Broker" />
+            <div className="p-4">
+              <DataRow label="host" value={`${data?.broker.host ?? "—"}:${data?.broker.port ?? "—"}`} />
+              <DataRow label="base topic" value={data?.broker.base_topic ?? "—"} />
+              <DataRow label="connected" value={data?.broker.connected_at ? relativeTime(data.broker.connected_at) : "—"} mono={false} />
+              <DataRow label="last message" value={data?.broker.last_message_at ? relativeTime(data.broker.last_message_at) : "—"} mono={false} />
+              <DataRow label="error" value={data?.broker.last_error ?? "none"} mono={false} />
+            </div>
+          </Panel>
+
+          <Panel>
+            <PanelHead title="Round transfer history" icon={<ScrollText size={14} />} />
+            <div className="p-4">
+              <Sparkline
+                values={history.map((row) => row.bytes_up + row.bytes_down)}
+                width={260}
+                height={44}
+              />
+              <div className="mt-3">
+                {history.slice(-6).reverse().map((row) => (
+                  <DataRow
+                    key={row.round}
+                    label={`round ${row.round} · ${row.received}/${row.selected}`}
+                    value={`${formatBytes(row.bytes_up)} / ${formatBytes(row.bytes_down)}`}
+                  />
+                ))}
+              </div>
+            </div>
+          </Panel>
+        </div>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        <Panel>
+          <PanelHead title="Topic contract" subtitle="The MQTT surface this system depends on" />
+          <div className="max-h-72 overflow-auto p-4">
+            {(data?.topic_contract ?? []).map((topic) => (
+              <div key={topic.topic} className="border-b border-line/60 py-2 last:border-0">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="mono truncate text-[11px] text-ink-300">{topic.topic}</span>
+                  <Badge tone={topic.direction === "up" ? "info" : "accent"}>
+                    {topic.direction}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-2xs leading-relaxed text-ink-600">{topic.purpose}</p>
+              </div>
+            ))}
           </div>
-        ) : null}
-      </Panel>
+        </Panel>
+
+        <Panel>
+          <PanelHead title="Model transfer" />
+          <div className="p-4">
+            <DataRow label="model version" value={data?.model_transfer.model_version ?? "—"} />
+            <DataRow label="parameters" value={formatInteger(data?.model_transfer.parameters)} />
+            <DataRow label="float32 bytes" value={formatBytes(data?.model_transfer.bytes)} />
+            <DataRow label="chunk size" value={formatBytes(data?.model_transfer.chunk_size)} />
+            <DataRow label="chunks" value={formatInteger(data?.model_transfer.chunks)} />
+            <DataRow label="last announce" value={data?.last_model_announce?.at ? relativeTime(data.last_model_announce.at) : "—"} mono={false} />
+            <p className="mt-3 text-[11px] leading-relaxed text-ink-500">
+              {data?.provenance.note}
+            </p>
+          </div>
+        </Panel>
+      </div>
+
+      {error ? <p className="text-[11px] text-bad-text">{error}</p> : null}
     </div>
   );
 }

@@ -174,6 +174,44 @@ def _verify_chunk(message: dict[str, Any]) -> bool | None:
     return actual == expected.lower()
 
 
+def _activity_class(event: dict[str, Any]) -> tuple[str, str]:
+    """Normalize a raw MQTT event into a dashboard activity category."""
+    kind = str(event.get("kind") or "other")
+    status = str(event.get("status") or "").lower()
+    if kind.startswith("observer_"):
+        return "infrastructure", ("error" if status == "rejected" else "info")
+    if kind == "invalid":
+        return "infrastructure", "error"
+    if kind == "session":
+        if status in {"error", "stopped", "failed"}:
+            return "session", "error" if status == "error" else "warning"
+        return "session", "success" if status in {"completed"} else "info"
+    if kind in {"round_progress", "round_start", "round_summary"}:
+        severity = (
+            "error"
+            if status in {"failed", "error"}
+            else "warning"
+            if status in {"rejected", "skipped", "insufficient_updates", "stopped"}
+            else "success"
+            if status in {"complete", "completed", "accepted"}
+            else "info"
+        )
+        return "round", severity
+    if kind in {"model_announce", "model_chunk"}:
+        if event.get("checksum_ok") is False:
+            return "transfer", "error"
+        return "transfer", "success" if kind == "model_announce" else "info"
+    if kind in {"update_meta", "update_chunk", "ack_accepted", "ack_rejected"}:
+        if kind == "ack_rejected" or event.get("checksum_ok") is False:
+            return "transfer", "error"
+        return "transfer", "success" if kind == "ack_accepted" else "info"
+    if kind.startswith("worker_"):
+        return "worker", "error" if status == "rejected" else "info"
+    if kind in {"status", "health"}:
+        return "node", "warning" if status == "rejected" else "info"
+    return "unknown", "info"
+
+
 class TelemetryStore:
     """Bounded live state assembled from observed MQTT traffic."""
 
@@ -241,6 +279,9 @@ class TelemetryStore:
         self._round_progress: dict[int, dict[str, Any]] = {}
         self._round_summaries: dict[int, dict[str, Any]] = {}
         self._round_summary_order: deque[int] = deque(maxlen=200)
+        self._activity: deque[dict[str, Any]] = deque(maxlen=300)
+        self._event_fingerprints: dict[str, float] = {}
+        self._last_session_fingerprint: str | None = None
 
     # --------------------------------------------------------------- broker
     def set_broker_state(
@@ -375,10 +416,55 @@ class TelemetryStore:
         }
 
     def _append_event(self, event: dict[str, Any], now: float) -> None:
+        kind = str(event.get("kind") or "")
+        if kind == "session":
+            # The coordinator republishes its retained session every few
+            # seconds as a heartbeat.  Only surface a session activity entry
+            # when the meaningful state actually changes, otherwise the feed
+            # fills with identical "completed"/"idle" rows.
+            session_fingerprint = "|".join(
+                str(event.get(key) or "")
+                for key in ("node_id", "status", "detail")
+            )
+            if session_fingerprint == self._last_session_fingerprint:
+                return
+            self._last_session_fingerprint = session_fingerprint
+        # A reconnect replays retained messages.  Do not present the same
+        # retained snapshot as new activity within a short window.
+        fingerprint = "|".join(
+            str(event.get(key) or "")
+            for key in ("topic", "kind", "node_id", "round", "status", "detail")
+        )
+        if event.get("retained"):
+            previous = self._event_fingerprints.get(fingerprint)
+            if previous is not None and now - previous < 3.0:
+                return
+            self._event_fingerprints[fingerprint] = now
+            if len(self._event_fingerprints) > 800:
+                cutoff = now - 30.0
+                self._event_fingerprints = {
+                    key: value
+                    for key, value in self._event_fingerprints.items()
+                    if value >= cutoff
+                }
+        event["category"], event["severity"] = _activity_class(event)
         self._event_id += 1
         event["id"] = self._event_id
         event.setdefault("at", _iso(now))
         self._events.append(event)
+        self._activity.append(
+            {
+                "id": event["id"],
+                "at": event.get("at"),
+                "category": event["category"],
+                "severity": event["severity"],
+                "kind": event["kind"],
+                "node_id": event.get("node_id"),
+                "round": event.get("round"),
+                "status": event.get("status"),
+                "detail": event.get("detail"),
+            }
+        )
         callback = self._on_event
         if callback is not None:
             try:
@@ -698,15 +784,25 @@ class TelemetryStore:
         now: float,
     ) -> dict[str, Any]:
         state = message.get("state")
+        updated_at = _parse_iso(message.get("updated_utc") or message.get("ts"))
         self._session = {
             "session_id": message.get("session_id"),
             "state": state,
             "config": message.get("config") if isinstance(message.get("config"), dict) else None,
             "round": _safe_int(message.get("round")),
             "completed_rounds": _safe_int(message.get("completed_rounds")) or 0,
+            "accepted_total": _safe_int(message.get("accepted_total")) or 0,
+            "total_rounds": _safe_int(message.get("total_rounds")),
             "message": message.get("message"),
             "latest_model_version": message.get("latest_model_version"),
             "updated_utc": message.get("updated_utc") or message.get("ts"),
+            "started_utc": message.get("started_utc"),
+            "last_control": (
+                dict(message.get("last_control"))
+                if isinstance(message.get("last_control"), dict)
+                else None
+            ),
+            "updated_at": updated_at,
             "retained": retain,
             "observed_at": now,
         }
@@ -727,6 +823,83 @@ class TelemetryStore:
             ),
             "direction": "down",
         }
+
+    def _session_view(self, now: float) -> dict[str, Any] | None:
+        """Derived, honest view of coordinator session freshness."""
+        if self._session is None:
+            return None
+        session = dict(self._session)
+        updated_at = session.get("updated_at") or session.get("observed_at")
+        started_at = _parse_iso(session.get("started_utc"))
+        age = None if updated_at is None else max(0.0, now - float(updated_at))
+        elapsed = None if started_at is None else max(0.0, now - started_at)
+        state = str(session.get("state") or "unknown")
+        active_states = {"starting", "waiting", "running", "paused", "stopping"}
+        active = state in active_states
+        stale = bool(
+            active and (age is None or age > max(20.0, 4.0 * self.heartbeat_sec))
+        )
+        total = session.get("total_rounds")
+        completed = int(session.get("completed_rounds") or 0)
+        session.update(
+            {
+                "active": active,
+                "stale": stale,
+                "age_sec": None if age is None else round(age, 1),
+                "elapsed_sec": None if elapsed is None else round(elapsed, 1),
+                "remaining_rounds": (
+                    None if total is None else max(0, int(total) - completed)
+                ),
+                "progress": (
+                    None
+                    if total in (None, 0)
+                    else round(min(1.0, completed / float(total)), 4)
+                ),
+                "last_control": session.get("last_control"),
+            }
+        )
+        return session
+
+    def _infrastructure(
+        self, now: float, worker_counts: dict[str, int]
+    ) -> dict[str, Any]:
+        last_message = self._broker["last_message_at"]
+        message_age = (
+            None if last_message is None else round(max(0.0, now - last_message), 1)
+        )
+        session = self._session_view(now)
+        connected = bool(self._broker["connected"])
+        session_stale = bool(session and session.get("stale"))
+        return {
+            "broker": {
+                "connected": connected,
+                "last_error": self._broker["last_error"],
+                "last_message_age_sec": message_age,
+            },
+            "observer": {
+                "events": len(self._events),
+                "started_at": _iso(self._started_at),
+                "quiet": bool(
+                    connected
+                    and (
+                        message_age is None
+                        or message_age > max(30.0, 3.0 * self.heartbeat_sec)
+                    )
+                ),
+            },
+            "workers": worker_counts,
+            "session": {
+                "present": session is not None,
+                "state": (session or {}).get("state"),
+                "stale": session_stale,
+                "age_sec": (session or {}).get("age_sec"),
+            },
+            "healthy": bool(connected and not session_stale),
+        }
+
+    def activity(self, limit: int = 80) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in list(self._activity)[-limit:][::-1]]
 
     def _handle_round_progress(
         self,
@@ -1071,7 +1244,9 @@ class TelemetryStore:
         }
 
     # -------------------------------------------------------------- status
-    def _dynamic_worker_view(self, entry: dict[str, Any], now: float) -> dict[str, Any]:
+    def _dynamic_worker_view(
+        self, entry: dict[str, Any], now: float, selected: set[str] | None = None
+    ) -> dict[str, Any]:
         last_seen = entry.get("last_seen")
         age = None if last_seen is None else max(0.0, now - float(last_seen))
         online = (
@@ -1100,6 +1275,7 @@ class TelemetryStore:
             "connection": "online" if online else "offline",
             "status": status,
             "selectable": selectable,
+            "selected": entry["id"] in (selected or set()),
             "last_seen_age_sec": None if age is None else round(age, 1),
             "last_seen": _iso(last_seen),
             "registered_at": _iso(entry.get("registered_at")),
@@ -1177,8 +1353,50 @@ class TelemetryStore:
         rejected = source.get("rejected")
         rejected_map = dict(rejected) if isinstance(rejected, dict) else {}
         selected = [str(item) for item in (source.get("selected") or [])]
+        timings = source.get("timings") if isinstance(source.get("timings"), dict) else {}
+        accepted_samples = _safe_int(source.get("accepted_samples")) or _safe_int(
+            timings.get("total_samples")
+        ) or 0
+        aggregation_seconds = _safe_float(
+            source.get("aggregation_seconds")
+        )
+        if aggregation_seconds is None:
+            aggregation_seconds = _safe_float(timings.get("aggregation_seconds"))
         observed = float((progress or summary or {}).get("observed_at") or now)
         status = str(source.get("status") or "unknown")
+        stage_times = dict(
+            source.get("stage_times")
+            or (timings.get("stage_times") if isinstance(timings, dict) else {})
+            or {}
+        )
+        # Progress messages carry an explicit timeline.  Completed rounds are
+        # summarised without one, so derive a timeline from the coordinator's
+        # recorded stage timestamps.  Nothing is invented: entries exist only
+        # where the coordinator reported a time.
+        timeline = list(source.get("timeline") or [])
+        if not timeline and stage_times:
+            stage_status = {item["key"]: item["status"] for item in stages}
+            entries: list[dict[str, Any]] = []
+            for key, label in ROUND_STAGES:
+                timing = stage_times.get(key)
+                if not isinstance(timing, dict):
+                    continue
+                at = timing.get("started_utc") or timing.get("ended_utc")
+                if not at:
+                    continue
+                seconds = _safe_float(timing.get("seconds"))
+                entries.append(
+                    {
+                        "stage": key,
+                        "label": label,
+                        "status": stage_status.get(key, "unknown"),
+                        "at": at,
+                        "detail": (
+                            f"{seconds:.2f}s" if seconds is not None else None
+                        ),
+                    }
+                )
+            timeline = sorted(entries, key=lambda item: str(item["at"]))
         is_live = bool(
             self._broker["connected"]
             and summary is None
@@ -1201,11 +1419,15 @@ class TelemetryStore:
             "rejected": sorted(rejected_map),
             "reasons": rejected_map,
             "checksums": dict(source.get("checksums") or {}),
-            "registered_version": source.get("model_version") if summary_completed else None,
+            "registered_version": (
+                source.get("registered_version")
+                if source.get("registered_version")
+                else (source.get("model_version") if summary_completed else None)
+            ),
             "single_client": bool(source.get("single_client")),
             "aggregated": bool(source.get("aggregated")),
             "status": status,
-            "started_at": _iso(observed),
+            "started_at": source.get("round_started_utc") or _iso(observed),
             "last_event_at": _iso(observed),
             "bytes_up": int(source.get("bytes_up") or 0),
             "bytes_down": int(source.get("bytes_down") or 0),
@@ -1221,6 +1443,12 @@ class TelemetryStore:
             "is_live": is_live,
             "idle_seconds": round(max(0.0, now - observed), 1),
             "stages": stages,
+            "timeline": timeline,
+            "stage_times": stage_times,
+            "contributions": list(source.get("contributions") or []),
+            "accepted_samples": int(accepted_samples or 0),
+            "aggregation_seconds": aggregation_seconds,
+            "seconds": _safe_float(source.get("seconds")),
             "source": "coordinator",
         }
 
@@ -1373,9 +1601,13 @@ class TelemetryStore:
     ) -> dict[str, Any]:
         now = time.time() if now is None else now
         with self._lock:
+            live_round = self._round_view(now)
+            authoritative_round = self._authoritative_round_view(now)
+            reference_round = authoritative_round or live_round
+            selected = set((reference_round or {}).get("selected") or [])
             nodes = [self._node_view(node_id, now) for node_id in self.nodes]
             worker_views = [
-                self._dynamic_worker_view(entry, now)
+                self._dynamic_worker_view(entry, now, selected)
                 for entry in sorted(
                     self._dynamic_workers.values(), key=lambda item: item["id"]
                 )
@@ -1401,8 +1633,6 @@ class TelemetryStore:
                         "worker": worker,
                     }
                 )
-            live_round = self._round_view(now)
-            authoritative_round = self._authoritative_round_view(now)
             latest = registry.get("latest") or {}
             historical_round = None
             rounds = registry.get("rounds") or []
@@ -1462,6 +1692,9 @@ class TelemetryStore:
                 "workers": worker_views,
                 "worker_counts": worker_counts,
                 "session": dict(self._session) if self._session else None,
+                "session_view": self._session_view(now),
+                "activity": [dict(item) for item in list(self._activity)[-60:][::-1]],
+                "infrastructure": self._infrastructure(now, worker_counts),
                 "round_progress": authoritative_round,
                 "round_summaries": [
                     dict(self._round_summaries[number])
@@ -1515,6 +1748,22 @@ class TelemetryStore:
             live_round = self._round_view(now)
             latest = registry.get("latest") or {}
             rounds = registry.get("rounds") or []
+            # rounds.csv can contain more than one row for a round (for
+            # example a progress-only row and the completed row).  Keep the
+            # richest row per round so the history never shows duplicates.
+            by_round: dict[int, dict[str, Any]] = {}
+            for row in rounds:
+                try:
+                    number = int(row.get("round"))
+                except (TypeError, ValueError):
+                    continue
+                score = (
+                    int(row.get("received") or 0),
+                    int(row.get("bytes_up") or 0) + int(row.get("bytes_down") or 0),
+                )
+                previous = by_round.get(number)
+                if previous is None or score >= previous["_score"]:
+                    by_round[number] = {**row, "_score": score}
             history = [
                 {
                     "round": row.get("round"),
@@ -1525,7 +1774,7 @@ class TelemetryStore:
                     "dropped_nodes": row.get("dropped_nodes", []),
                     "round_time_sec": row.get("round_time_sec"),
                 }
-                for row in rounds
+                for _, row in sorted(by_round.items())
             ]
             return {
                 "server_time": _iso(now),

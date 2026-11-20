@@ -8,7 +8,10 @@ coordinator or modifies its registry.
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -395,37 +398,89 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def _session_snapshot() -> dict[str, Any] | None:
         return state.store.session_snapshot()
 
-    def _ensure_stack_ready(timeout: float = 45.0) -> dict[str, Any]:
-        """Start/verify broker + coordinator and wait for a retained session."""
+    control_lock = threading.Lock()
+    control_cache: dict[str, dict[str, Any]] = {}
+
+    def _ensure_stack_ready(timeout: float = 30.0) -> dict[str, Any]:
+        """Start/verify broker + coordinator and prove the control link works.
+
+        Process liveness is not enough: a freshly launched coordinator needs a
+        moment to subscribe, and a *previous* run's retained session or log
+        lines must never be mistaken for the current one.  Readiness is proven
+        by publishing a uniquely-identified ``ping_session`` and waiting for
+        the coordinator to echo that exact request id.  Pings are re-published
+        until the echo arrives, so a publish that races the subscription is
+        simply retried instead of failing the start.
+        """
         manager = state.processes
         broker = manager.start_broker()
         launched = manager.start_coordinator()
         deadline = datetime.now(timezone.utc).timestamp() + timeout
+        probe_id = uuid.uuid4().hex
+        last_publish = 0.0
         while datetime.now(timezone.utc).timestamp() < deadline:
             status = manager.status_of("coordinator")
-            if status is not None and not status["running"]:
+            if status is not None and not status.get("running"):
                 raise ProcessError(
                     "coordinator exited at startup: "
                     + " | ".join(
                         manager.logs("coordinator", lines=12)["lines"][-8:]
                     )
                 )
-            if _session_snapshot() is not None:
-                return {"broker": broker, "coordinator": launched}
-            time.sleep(0.25)
+            if status is not None and status.get("running"):
+                now = time.monotonic()
+                if now - last_publish >= 0.5:
+                    try:
+                        state.controller.publish(
+                            "ping_session", request_id=probe_id
+                        )
+                    except ControlError:
+                        pass
+                    last_publish = now
+                snapshot = _session_snapshot()
+                last = (snapshot or {}).get("last_control") or {}
+                if last.get("request_id") == probe_id:
+                    return {
+                        "broker": broker,
+                        "coordinator": launched,
+                        "control": "acknowledged",
+                        "request_id": probe_id,
+                        "session_seen": snapshot is not None,
+                    }
+            time.sleep(0.2)
         raise ProcessError(
-            "coordinator did not publish a session state within "
-            f"{timeout:.0f}s; check dashboard/backend logs and the coordinator log"
+            "coordinator process is up but did not answer a control ping within "
+            f"{timeout:.0f}s; check the coordinator log"
         )
 
-    def _wait_for_session(states: set[str], timeout: float = 15.0) -> dict[str, Any] | None:
+    def _control_ack(
+        request_id: str, command: str, timeout: float = 20.0
+    ) -> dict[str, Any] | None:
+        """Wait until the coordinator echoes this request_id in session state."""
         deadline = datetime.now(timezone.utc).timestamp() + timeout
         while datetime.now(timezone.utc).timestamp() < deadline:
             snapshot = _session_snapshot()
-            if snapshot and snapshot.get("state") in states:
-                return snapshot
+            if snapshot:
+                last = snapshot.get("last_control") or {}
+                if last.get("request_id") == request_id and last.get(
+                    "command"
+                ) == command:
+                    return snapshot
             time.sleep(0.2)
-        return _session_snapshot()
+        return None
+
+    def _failure_detail(command: str, request_id: str) -> str:
+        tail: list[str] = []
+        try:
+            tail = state.processes.logs("coordinator", lines=16)["lines"][-10:]
+        except ProcessError:
+            pass
+        return (
+            f"coordinator did not acknowledge {command} (request {request_id}) "
+            "within the timeout. It may be stopped, unreachable, or not running "
+            "in --control mode."
+            + (f" Log tail: {' | '.join(tail)}" if tail else "")
+        )
 
     @app.get("/api/session")
     def session() -> dict[str, Any]:
@@ -433,16 +488,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload = state.store.status_payload(registry)
         return {
             "available": payload.get("session") is not None,
-            "session": payload.get("session"),
+            "session": payload.get("session_view") or payload.get("session"),
             "current_round": payload.get("current_round"),
             "round_progress": payload.get("round_progress"),
             "round_summaries": payload.get("round_summaries", []),
             "workers": payload.get("workers", []),
             "worker_counts": payload.get("worker_counts", {}),
+            "infrastructure": payload.get("infrastructure"),
+            "activity": payload.get("activity", []),
             "processes": state.processes.status(),
             "stage_definition": [
                 {"key": key, "label": label} for key, label in ROUND_STAGES
             ],
+        }
+
+    @app.get("/api/activity")
+    def activity(limit: int = Query(default=80, ge=1, le=400)) -> dict[str, Any]:
+        registry = state.registry_snapshot()
+        payload = state.store.status_payload(registry)
+        return {
+            "server_time": payload.get("server_time"),
+            "activity": state.store.activity(limit=limit),
+            "infrastructure": payload.get("infrastructure"),
+            "session": payload.get("session_view"),
+            "current_round": payload.get("current_round"),
         }
 
     @app.get("/api/workers")
@@ -478,51 +547,96 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/control/session")
     def control_session(request: SessionRequest) -> dict[str, Any]:
+        active_states = {"starting", "waiting", "running", "paused", "stopping"}
         try:
-            if request.action == "start":
-                config = TrainingConfig.from_dict(request.config)
-                readiness = (
-                    _ensure_stack_ready() if state.settings.mqtt_enabled else None
+            with control_lock:
+                signature = request.action + "|" + json.dumps(
+                    request.config or {}, sort_keys=True, default=str
                 )
-                if config.launch_workers and config.simulation_workers > 0:
-                    state.processes.start_workers(
-                        count=config.simulation_workers,
-                        role=config.worker_role,
-                        simulation=True,
+                cached = control_cache.get(signature)
+                if cached and time.time() - float(cached.get("_ts", 0)) < 10.0:
+                    replay = {
+                        key: value for key, value in cached.items() if key != "_ts"
+                    }
+                    replay["idempotent_replay"] = True
+                    return replay
+
+                current = _session_snapshot() or {}
+                if request.action == "start":
+                    config = TrainingConfig.from_dict(request.config)
+                    if current.get("state") in active_states:
+                        raise ControlError(
+                            "a session is already active "
+                            f"({current.get('state')}, {current.get('session_id')}); "
+                            "stop it before starting another"
+                        )
+                    readiness = (
+                        _ensure_stack_ready()
+                        if state.settings.mqtt_enabled
+                        else None
                     )
-                state.controller.publish(
-                    "start_session", config=config.to_dict()
-                )
-                snapshot = _wait_for_session(
-                    {"waiting", "running", "paused"}, timeout=20.0
-                )
-                return {
-                    "ok": True,
-                    "command": "start_session",
-                    "config": config.to_dict(),
-                    "readiness": readiness,
-                    "session": snapshot,
-                    "processes": state.processes.status(),
-                }
-            command = f"{request.action}_session"
-            status = state.processes.status_of("coordinator")
-            if status is None or not status["running"]:
-                raise ProcessError(
-                    "coordinator is not running; start a session first"
-                )
-            state.controller.publish(command)
-            expected = {
-                "pause_session": "paused",
-                "resume_session": "running",
-                "stop_session": "stopped",
-            }[command]
-            snapshot = _wait_for_session({expected}, timeout=20.0)
-            return {
-                "ok": True,
-                "command": command,
-                "session": snapshot,
-                "processes": state.processes.status(),
-            }
+                    if config.launch_workers and config.simulation_workers > 0:
+                        state.processes.start_workers(
+                            count=config.simulation_workers,
+                            role=config.worker_role,
+                            simulation=True,
+                        )
+                    command = "start_session"
+                    request_id = uuid.uuid4().hex
+                    state.controller.publish(
+                        command,
+                        config=config.to_dict(),
+                        request_id=request_id,
+                    )
+                    ack = _control_ack(request_id, command, timeout=20.0)
+                    if ack is None:
+                        raise HTTPException(
+                            status_code=504,
+                            detail=_failure_detail(command, request_id),
+                        )
+                    result = {
+                        "ok": True,
+                        "command": command,
+                        "request_id": request_id,
+                        "acknowledged": True,
+                        "config": config.to_dict(),
+                        "readiness": readiness,
+                        "session": state.store.session_snapshot(),
+                        "processes": state.processes.status(),
+                    }
+                else:
+                    command = f"{request.action}_session"
+                    status = state.processes.status_of("coordinator")
+                    if status is None or not status.get("running"):
+                        raise ProcessError(
+                            "coordinator is not running; start a session first"
+                        )
+                    expected = {
+                        "pause_session": "paused",
+                        "resume_session": "running",
+                        "stop_session": "stopped",
+                    }[command]
+                    request_id = uuid.uuid4().hex
+                    state.controller.publish(command, request_id=request_id)
+                    ack = _control_ack(request_id, command, timeout=20.0)
+                    if ack is None:
+                        raise HTTPException(
+                            status_code=504,
+                            detail=_failure_detail(command, request_id),
+                        )
+                    result = {
+                        "ok": True,
+                        "command": command,
+                        "request_id": request_id,
+                        "acknowledged": True,
+                        "expected_state": expected,
+                        "session": ack,
+                        "processes": state.processes.status(),
+                    }
+                control_cache[signature] = {**result, "_ts": time.time()}
+                if len(control_cache) > 32:
+                    control_cache.pop(next(iter(control_cache)))
+                return result
         except (ProtocolError, ProcessError, ControlError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -614,10 +728,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
         queue = state.hub.subscribe()
+
+        async def sender() -> None:
+            while True:
+                payload = await queue.get()
+                await websocket.send_json(payload)
+
+        async def receiver() -> None:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(message, dict) and message.get("type") == "ping":
+                    await websocket.send_json(
+                        {"type": "pong", "at": _utc_now()}
+                    )
+
+        tasks: list[asyncio.Task[None]] = []
         try:
+            registry = state.registry_snapshot()
+            snapshot = state.store.status_payload(registry)
             await websocket.send_json(
                 {
-                    "type": "hello",
+                    "type": "snapshot",
                     "at": _utc_now(),
                     "data": {
                         "mqtt_enabled": state.settings.mqtt_enabled,
@@ -626,15 +761,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             "port": state.settings.broker_port,
                             "base_topic": state.settings.base_topic,
                         },
+                        "server_time": snapshot.get("server_time"),
+                        "session": snapshot.get("session_view"),
+                        "current_round": snapshot.get("current_round"),
+                        "worker_counts": snapshot.get("worker_counts"),
+                        "infrastructure": snapshot.get("infrastructure"),
+                        "data_source": snapshot.get("data_source"),
                     },
                 }
             )
-            while True:
-                payload = await queue.get()
-                await websocket.send_json(payload)
+            tasks = [
+                asyncio.create_task(sender()),
+                asyncio.create_task(receiver()),
+            ]
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                exc = task.exception()
+                if exc is not None and not isinstance(
+                    exc, (WebSocketDisconnect, RuntimeError)
+                ):
+                    raise exc
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
+            for task in tasks:
+                task.cancel()
             state.hub.unsubscribe(queue)
 
     dist = Path(state.settings.frontend_dist)

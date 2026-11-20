@@ -389,6 +389,43 @@ def test_dynamic_worker_presence_expiry_and_roles() -> None:
     assert later["worker_counts"]["online"] == 0
 
 
+def test_session_heartbeat_is_not_duplicated_in_activity() -> None:
+    from common.worker_protocol import build_session_state
+
+    store = _store()
+    message = build_session_state(
+        session_id="sess-1",
+        state="running",
+        config={"rounds": 1},
+        message="Round 1 in progress",
+    )
+    store.ingest("aq/fl/session", message, retain=True, now=100.0)
+    store.ingest("aq/fl/session", message, retain=True, now=105.0)
+    store.ingest("aq/fl/session", message, retain=True, now=110.0)
+    session_rows = [
+        row for row in store.activity(20) if row["kind"] == "session"
+    ]
+    assert len(session_rows) == 1
+    assert "running" in session_rows[0]["detail"]
+
+    store.ingest(
+        "aq/fl/session",
+        build_session_state(
+            session_id="sess-1",
+            state="completed",
+            config={"rounds": 1},
+            message="Session finished: 1 completed round(s)",
+        ),
+        retain=True,
+        now=115.0,
+    )
+    session_rows = [
+        row for row in store.activity(20) if row["kind"] == "session"
+    ]
+    assert len(session_rows) == 2
+    assert "completed" in session_rows[0]["detail"]
+
+
 def test_dynamic_round_progress_and_summary_are_authoritative() -> None:
     store = _store()
     store.set_broker_state(True, now=100.0)
@@ -449,6 +486,20 @@ def test_dynamic_round_progress_and_summary_are_authoritative() -> None:
             "seconds": 2.5,
             "single_client": False,
             "aggregated": False,
+            "timings": {
+                "stage_times": {
+                    "model_distribution": {
+                        "started_utc": "2026-01-01T00:00:01.000Z",
+                        "ended_utc": "2026-01-01T00:00:01.500Z",
+                        "seconds": 0.5,
+                    },
+                    "local_training": {
+                        "started_utc": "2026-01-01T00:00:01.500Z",
+                        "ended_utc": "2026-01-01T00:00:02.500Z",
+                        "seconds": 1.0,
+                    },
+                }
+            },
         },
         retain=True,
         now=102.0,
@@ -462,6 +513,13 @@ def test_dynamic_round_progress_and_summary_are_authoritative() -> None:
     assert final_stages["model_registration"] == "skipped"
     assert round_view["aggregated"] is False
     assert snapshot["round_summaries"][0]["round"] == 4
+    # A completed summary has no explicit timeline, so one is derived from the
+    # coordinator's stage timestamps in chronological order.
+    assert [entry["stage"] for entry in round_view["timeline"]] == [
+        "model_distribution",
+        "local_training",
+    ]
+    assert round_view["timeline"][0]["detail"] == "0.50s"
 
 
 def test_control_endpoints_publish_real_commands(tmp_path: Path) -> None:
@@ -500,6 +558,15 @@ def test_control_endpoints_publish_real_commands(tmp_path: Path) -> None:
                 state=state_of_session,
                 config=kwargs.get("config"),
                 message="fake coordinator",
+                last_control=(
+                    {
+                        "command": command,
+                        "request_id": kwargs.get("request_id"),
+                        "at": "2026-01-01T00:00:00.000Z",
+                    }
+                    if kwargs.get("request_id")
+                    else None
+                ),
             )
             state.store.ingest("aq/fl/session", message)
 
@@ -570,6 +637,94 @@ def test_control_endpoints_publish_real_commands(tmp_path: Path) -> None:
         assert invalid.status_code == 409
 
 
+def test_stack_readiness_proves_control_link(tmp_path: Path) -> None:
+    """A stale retained session/log must not satisfy readiness.
+
+    Readiness is only confirmed when the coordinator echoes a *fresh*
+    ping request id, so a publish racing the subscription is retried.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from common.worker_protocol import build_session_state
+    from dashboard.backend.main import create_app
+
+    registry = _write_registry(tmp_path)
+    settings = replace(
+        Settings.load(),
+        mqtt_enabled=True,
+        registry_dir=registry,
+        registry_source="test",
+        dataset_path=tmp_path / "data.csv",
+        predictions_path=tmp_path / "predictions.json",
+    )
+    app = create_app(settings)
+    state = app.state.airfed
+
+    # A retained snapshot from a previous coordinator run is already in the
+    # store. It must not short-circuit readiness.
+    state.store.ingest(
+        "aq/fl/session",
+        build_session_state(
+            session_id="sess-old",
+            state="idle",
+            config=None,
+            message="stale retained snapshot",
+            last_control=None,
+        ),
+    )
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.pings: list[str] = []
+
+        def publish(self, command: str, **kwargs) -> None:
+            assert command == "ping_session"
+            request_id = kwargs.get("request_id")
+            self.pings.append(request_id)
+            # Simulate a coordinator that is not subscribed yet: the first
+            # publish is lost, the second is acknowledged.
+            if len(self.pings) >= 2:
+                state.store.ingest(
+                    "aq/fl/session",
+                    build_session_state(
+                        session_id="sess-old",
+                        state="idle",
+                        config=None,
+                        message="Coordinator ready",
+                        last_control={
+                            "command": command,
+                            "request_id": request_id,
+                            "at": "2026-01-01T00:00:00.000Z",
+                        },
+                    ),
+                )
+
+    controller = FakeController()
+    state.controller = controller
+
+    class FakeProcesses:
+        def start_broker(self):
+            return {"ok": True}
+
+        def start_coordinator(self):
+            return {"ok": True}
+
+        def status_of(self, name: str):
+            return {"name": name, "running": True, "pid": 1}
+
+    state.processes = FakeProcesses()
+
+    with TestClient(app) as client:
+        response = client.post("/api/processes/start", json={"name": "stack"})
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["control"] == "acknowledged"
+        assert len(controller.pings) >= 2
+        assert all(controller.pings)
+        assert len(set(controller.pings)) == 1
+
+
 def test_api_endpoints_and_websocket(tmp_path: Path) -> None:
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
@@ -611,6 +766,8 @@ def test_api_endpoints_and_websocket(tmp_path: Path) -> None:
         assert client.get("/api/session").json()["available"] is False
         invalid = client.post("/api/processes/start", json={"name": "nope"})
         assert invalid.status_code == 409
+        # A broker that is down must surface as 409, never a silent success.
+        app.state.airfed.processes.broker_reachable = lambda: False
         launch = client.post("/api/workers/launch", json={"count": 1})
         assert launch.status_code == 409
         status = client.get("/api/status").json()
@@ -622,4 +779,4 @@ def test_api_endpoints_and_websocket(tmp_path: Path) -> None:
         assert air["prediction_source"] == "fedavg_offline"
         with client.websocket_connect("/ws") as websocket:
             hello = websocket.receive_json()
-            assert hello["type"] == "hello"
+            assert hello["type"] == "snapshot"

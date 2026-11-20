@@ -1,27 +1,40 @@
 import { useEffect, useRef, useState } from "react";
-import type { CommEvent, LiveMessage, SocketState } from "../types";
+import type { LiveMessage, SocketState } from "../types";
 import { websocketUrl } from "../lib/api";
 
 const MAX_BACKOFF = 15000;
 
 /**
- * Read-only WebSocket feed. Reconnects with capped exponential backoff and
- * exposes a revision counter that pages can use to refetch on new telemetry.
+ * WebSocket feed with automatic reconnect, an initial server snapshot, and
+ * client-initiated pings. The revision counter lets pages refetch on demand;
+ * the snapshot is the authoritative state at connect time.
  */
-export function useLiveFeed(): SocketState & { revision: number } {
+export function useLiveFeed(): SocketState & {
+  revision: number;
+  snapshot: LiveMessage["data"] | null;
+} {
   const [status, setStatus] = useState<SocketState["status"]>("connecting");
-  const [lastEvent, setLastEvent] = useState<CommEvent | null>(null);
+  const [lastEvent, setLastEvent] = useState<SocketState["lastEvent"]>(null);
   const [lastMessageAt, setLastMessageAt] = useState<string | null>(null);
   const [retryInMs, setRetryInMs] = useState<number | null>(null);
   const [revision, setRevision] = useState(0);
+  const [snapshot, setSnapshot] = useState<LiveMessage["data"] | null>(null);
 
   const socket = useRef<WebSocket | null>(null);
   const retry = useRef(0);
   const timer = useRef<number | null>(null);
+  const ping = useRef<number | null>(null);
   const disposed = useRef(false);
 
   useEffect(() => {
     disposed.current = false;
+
+    const clearPing = () => {
+      if (ping.current !== null) {
+        window.clearInterval(ping.current);
+        ping.current = null;
+      }
+    };
 
     const connect = () => {
       if (disposed.current) return;
@@ -40,6 +53,12 @@ export function useLiveFeed(): SocketState & { revision: number } {
         retry.current = 0;
         setStatus("open");
         setRetryInMs(null);
+        clearPing();
+        ping.current = window.setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "ping" }));
+          }
+        }, 20000);
       };
 
       ws.onmessage = (raw) => {
@@ -49,14 +68,15 @@ export function useLiveFeed(): SocketState & { revision: number } {
         } catch {
           return;
         }
-        if (message.type === "hello") {
+        if (message.type === "snapshot") {
+          setSnapshot(message.data ?? null);
           setStatus("open");
           return;
         }
+        if (message.type === "pong") return;
         setLastMessageAt(new Date().toISOString());
         if (message.type === "mqtt_event" && message.event) {
           setLastEvent(message.event);
-          // Batch UI refreshes: the feed could be chatty during weight upload.
           setRevision((value) => value + 1);
         }
       };
@@ -66,6 +86,7 @@ export function useLiveFeed(): SocketState & { revision: number } {
       };
 
       ws.onclose = () => {
+        clearPing();
         if (socket.current === ws) socket.current = null;
         if (disposed.current) return;
         setStatus("closed");
@@ -84,11 +105,12 @@ export function useLiveFeed(): SocketState & { revision: number } {
 
     return () => {
       disposed.current = true;
+      clearPing();
       if (timer.current !== null) window.clearTimeout(timer.current);
       socket.current?.close();
       socket.current = null;
     };
   }, []);
 
-  return { status, lastEvent, lastMessageAt, retryInMs, revision };
+  return { status, lastEvent, lastMessageAt, retryInMs, revision, snapshot };
 }

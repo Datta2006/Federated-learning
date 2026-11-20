@@ -34,6 +34,10 @@ CONTROL_COMMANDS = {
     "pause_session",
     "resume_session",
     "stop_session",
+    # Read-only liveness probe. The coordinator echoes the request id in
+    # `last_control` without changing session state, which lets the dashboard
+    # prove the control subscription is live before issuing a real command.
+    "ping_session",
 }
 SELECTION_STRATEGIES = {"all", "random"}
 AGGREGATION_METHODS = {"fedavg"}
@@ -339,7 +343,17 @@ def build_session_state(
     completed_rounds: int = 0,
     message: str | None = None,
     latest_model_version: str | None = None,
+    started_utc: str | None = None,
+    total_rounds: int | None = None,
+    last_control: dict[str, Any] | None = None,
+    accepted_total: int = 0,
 ) -> dict[str, Any]:
+    """Retained coordinator session snapshot.
+
+    ``last_control`` echoes the ``request_id`` of the most recently processed
+    control command so the dashboard can prove the coordinator acted on it
+    instead of trusting an HTTP 200 on the publish call alone.
+    """
     return make_message(
         "flserver",
         message_type="session_state",
@@ -351,6 +365,10 @@ def build_session_state(
         message=message,
         latest_model_version=latest_model_version,
         updated_utc=utc_now_iso(),
+        started_utc=started_utc,
+        total_rounds=total_rounds,
+        last_control=dict(last_control) if last_control else None,
+        accepted_total=int(accepted_total),
     )
 
 
@@ -368,6 +386,13 @@ def build_round_progress(
     bytes_down: int,
     single_client: bool = False,
     detail: str | None = None,
+    timeline: list[dict[str, Any]] | None = None,
+    stage_times: dict[str, dict[str, Any]] | None = None,
+    accepted_samples: int = 0,
+    contributions: list[dict[str, Any]] | None = None,
+    aggregation_seconds: float | None = None,
+    registered_version: str | None = None,
+    round_started_utc: str | None = None,
 ) -> dict[str, Any]:
     if stage not in ROUND_STAGE_KEYS:
         raise ProtocolError(f"unknown round stage {stage!r}")
@@ -386,6 +411,17 @@ def build_round_progress(
         bytes_down=int(bytes_down),
         single_client=bool(single_client),
         detail=detail,
+        timeline=list(timeline or []),
+        stage_times=dict(stage_times or {}),
+        accepted_samples=int(accepted_samples),
+        contributions=list(contributions or []),
+        aggregation_seconds=(
+            round(float(aggregation_seconds), 3)
+            if aggregation_seconds is not None
+            else None
+        ),
+        registered_version=registered_version,
+        round_started_utc=round_started_utc,
     )
 
 
@@ -407,6 +443,9 @@ def build_round_summary(
     aggregated: bool,
     config: dict[str, Any] | None = None,
     detail: str | None = None,
+    received: int | None = None,
+    contributions: list[dict[str, Any]] | None = None,
+    timings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Auditable retained record for one completed/failed dynamic round."""
     return make_message(
@@ -418,6 +457,11 @@ def build_round_summary(
         accepted=list(accepted),
         rejected=dict(rejected),
         checksums=dict(checksums),
+        received=(
+            int(received) if received is not None else len(list(accepted))
+        ),
+        contributions=list(contributions or []),
+        timings=dict(timings or {}),
         model_version=model_version,
         evaluated_version=evaluated_version,
         weighted_val_loss=weighted_val_loss,

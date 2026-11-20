@@ -22,6 +22,28 @@ export interface Stage {
   status: StageStatus;
 }
 
+export interface TimelineEntry {
+  stage: string;
+  label: string;
+  status: string;
+  at: string;
+  detail: string | null;
+}
+
+export interface StageTiming {
+  started_utc: string | null;
+  ended_utc: string | null;
+  seconds: number | null;
+}
+
+export interface Contribution {
+  node_id: string;
+  n_samples: number;
+  n_val: number;
+  val_loss: number | null;
+  weight: number | null;
+}
+
 export interface RoundView {
   round: number;
   model_version: string | null;
@@ -41,10 +63,18 @@ export interface RoundView {
   bytes_down: number;
   phase: string;
   phase_label: string;
+  status?: string;
   is_live: boolean;
   idle_seconds: number | null;
   stages: Stage[];
-  source: "mqtt" | "registry";
+  timeline?: TimelineEntry[];
+  stage_times?: Record<string, StageTiming>;
+  contributions?: Contribution[];
+  accepted_samples?: number;
+  aggregation_seconds?: number | null;
+  seconds?: number | null;
+  weighted_val_loss?: number | null;
+  source: "mqtt" | "registry" | "coordinator";
 }
 
 export interface ModelRecord {
@@ -89,6 +119,7 @@ export interface WorkerView {
   connection: "online" | "offline";
   status: NodeStatus;
   selectable: boolean;
+  selected?: boolean;
 }
 
 export interface WorkerCounts {
@@ -107,9 +138,23 @@ export interface SessionState {
   config: TrainingConfigInput | null;
   round: number | null;
   completed_rounds: number;
+  accepted_total?: number;
+  total_rounds?: number | null;
   message: string | null;
   latest_model_version: string | null;
   updated_utc: string | null;
+  started_utc?: string | null;
+  last_control?: {
+    command: string;
+    request_id: string | null;
+    at: string;
+  } | null;
+  active?: boolean;
+  stale?: boolean;
+  age_sec?: number | null;
+  elapsed_sec?: number | null;
+  remaining_rounds?: number | null;
+  progress?: number | null;
   retained: boolean;
   observed_at?: number;
 }
@@ -239,6 +284,10 @@ export interface CommandResponse {
   started?: ProcessInfo[];
   skipped?: string[];
   stopped?: string[];
+  request_id?: string;
+  acknowledged?: boolean;
+  expected_state?: string;
+  idempotent_replay?: boolean;
 }
 
 export interface LogPayload {
@@ -271,6 +320,9 @@ export interface StatusPayload {
   workers?: WorkerView[];
   worker_counts?: WorkerCounts;
   session?: SessionState | null;
+  session_view?: SessionState | null;
+  activity?: ActivityItem[];
+  infrastructure?: Infrastructure;
   round_progress?: RoundView | null;
   round_summaries?: RoundSummaryView[];
   processes?: ProcessStatus;
@@ -542,13 +594,48 @@ export interface CommunicationPayload {
 }
 
 export interface LiveMessage {
-  type: "hello" | "mqtt_event" | "tick";
+  type: "hello" | "snapshot" | "mqtt_event" | "tick" | "pong";
   at?: string;
   event?: CommEvent;
   data?: {
     mqtt_enabled: boolean;
     broker: { host: string; port: number; base_topic: string };
+    server_time?: string;
+    session?: SessionState | null;
+    current_round?: RoundView | null;
+    worker_counts?: WorkerCounts;
+    infrastructure?: Infrastructure;
+    data_source?: string;
   };
+}
+
+export interface ActivityItem {
+  id: number;
+  at: string | null;
+  category: "session" | "round" | "transfer" | "worker" | "node" | "infrastructure" | "unknown";
+  severity: "info" | "success" | "warning" | "error";
+  kind: string;
+  node_id: string | null;
+  round: number | null;
+  status: string | null;
+  detail: string | null;
+}
+
+export interface Infrastructure {
+  broker: {
+    connected: boolean;
+    last_error: string | null;
+    last_message_age_sec: number | null;
+  };
+  observer: { events: number; started_at: string | null; quiet: boolean };
+  workers: WorkerCounts;
+  session: {
+    present: boolean;
+    state: string | null;
+    stale: boolean;
+    age_sec: number | null;
+  };
+  healthy: boolean;
 }
 
 export interface SocketState {

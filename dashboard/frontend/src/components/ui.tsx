@@ -1,86 +1,78 @@
 import type { ReactNode } from "react";
-import type { ModelRecord } from "../types";
-import { formatDateTime, formatInteger, formatNumber } from "../lib/format";
-import {
-  AlertTriangle,
-  ArrowDownRight,
-  ArrowUpRight,
-  CircleDot,
-  Radio,
-  RotateCw,
-} from "lucide-react";
+import { AlertTriangle, CircleDot, RotateCw } from "lucide-react";
 
-export type Tone = "emerald" | "blue" | "red" | "amber" | "mist" | "violet";
+export type Tone = "accent" | "ok" | "warn" | "bad" | "info" | "neutral";
 
-const toneClasses: Record<Tone, { text: string; border: string; bg: string; dot: string }> = {
-  emerald: {
-    text: "text-signal-emerald",
-    border: "border-signal-emerald/30",
-    bg: "bg-signal-emeraldDim/50",
-    dot: "bg-signal-emerald",
+const toneStyle: Record<
+  Tone,
+  { text: string; border: string; bg: string; dot: string }
+> = {
+  accent: {
+    text: "text-accent-text",
+    border: "border-accent/35",
+    bg: "bg-accent-dim",
+    dot: "bg-accent",
   },
-  blue: {
-    text: "text-signal-blue",
-    border: "border-signal-blue/30",
-    bg: "bg-signal-blueDim/50",
-    dot: "bg-signal-blue",
+  ok: {
+    text: "text-ok-text",
+    border: "border-ok/30",
+    bg: "bg-ok-soft",
+    dot: "bg-ok",
   },
-  red: {
-    text: "text-signal-red",
-    border: "border-signal-red/30",
-    bg: "bg-signal-redDim/50",
-    dot: "bg-signal-red",
+  warn: {
+    text: "text-warn-text",
+    border: "border-warn/30",
+    bg: "bg-warn-soft",
+    dot: "bg-warn",
   },
-  amber: {
-    text: "text-signal-amber",
-    border: "border-signal-amber/30",
-    bg: "bg-signal-amberDim/50",
-    dot: "bg-signal-amber",
+  bad: {
+    text: "text-bad-text",
+    border: "border-bad/35",
+    bg: "bg-bad-soft",
+    dot: "bg-bad",
   },
-  mist: {
-    text: "text-mist-400",
-    border: "border-ink-600",
-    bg: "bg-ink-750/60",
-    dot: "bg-mist-500",
+  info: {
+    text: "text-info-text",
+    border: "border-info/30",
+    bg: "bg-info-soft",
+    dot: "bg-info",
   },
-  violet: {
-    text: "text-signal-violet",
-    border: "border-signal-violet/30",
-    bg: "bg-signal-violet/10",
-    dot: "bg-signal-violet",
+  neutral: {
+    text: "text-ink-400",
+    border: "border-line2",
+    bg: "bg-raise",
+    dot: "bg-ink-500",
   },
 };
 
 export function Panel({
   children,
   className = "",
-  as: Tag = "section",
 }: {
   children: ReactNode;
   className?: string;
-  as?: "section" | "div" | "article";
 }) {
-  return <Tag className={`panel ${className}`}>{children}</Tag>;
+  return <section className={`panel ${className}`}>{children}</section>;
 }
 
-export function PanelHeader({
+export function PanelHead({
   title,
   subtitle,
-  icon,
   action,
+  icon,
 }: {
-  title: string;
-  subtitle?: string;
-  icon?: ReactNode;
+  title: ReactNode;
+  subtitle?: ReactNode;
   action?: ReactNode;
+  icon?: ReactNode;
 }) {
   return (
-    <div className="panel-header">
-      <div className="flex min-w-0 items-start gap-2.5">
-        {icon ? <div className="mt-0.5 shrink-0 text-mist-500">{icon}</div> : null}
+    <div className="panel-head">
+      <div className="flex min-w-0 items-start gap-2">
+        {icon ? <span className="mt-0.5 text-ink-500">{icon}</span> : null}
         <div className="min-w-0">
           <h2 className="panel-title">{title}</h2>
-          {subtitle ? <p className="panel-subtitle">{subtitle}</p> : null}
+          {subtitle ? <p className="panel-sub">{subtitle}</p> : null}
         </div>
       </div>
       {action ? <div className="shrink-0">{action}</div> : null}
@@ -88,25 +80,8 @@ export function PanelHeader({
   );
 }
 
-export function Badge({
-  children,
-  tone = "mist",
-  className = "",
-}: {
-  children: ReactNode;
-  tone?: Tone;
-  className?: string;
-}) {
-  const style = toneClasses[tone];
-  return (
-    <span className={`chip ${style.text} ${style.border} ${style.bg} ${className}`}>
-      {children}
-    </span>
-  );
-}
-
 export function Dot({
-  tone = "mist",
+  tone = "neutral",
   pulse = false,
   className = "",
 }: {
@@ -114,206 +89,203 @@ export function Dot({
   pulse?: boolean;
   className?: string;
 }) {
-  const style = toneClasses[tone];
   return (
-    <span className={`relative inline-flex h-2 w-2 ${className}`}>
+    <span className={`relative inline-flex h-1.5 w-1.5 ${className}`}>
       {pulse ? (
         <span
-          className={`absolute inset-0 rounded-full ${style.dot} animate-pulse-ring`}
+          className={`absolute inset-0 rounded-full ${toneStyle[tone].dot} animate-soft-pulse`}
         />
       ) : null}
-      <span className={`relative inline-flex h-2 w-2 rounded-full ${style.dot}`} />
+      <span
+        className={`relative inline-flex h-1.5 w-1.5 rounded-full ${toneStyle[tone].dot}`}
+      />
     </span>
   );
 }
 
-export function StatusBadge({
+export function Badge({
+  children,
+  tone = "neutral",
+  className = "",
+}: {
+  children: ReactNode;
+  tone?: Tone;
+  className?: string;
+}) {
+  const style = toneStyle[tone];
+  return (
+    <span className={`chip ${style.text} ${style.border} ${style.bg} ${className}`}>
+      {children}
+    </span>
+  );
+}
+
+export function statusTone(status: string | null | undefined): Tone {
+  switch (status) {
+    case "online":
+    case "running":
+    case "complete":
+    case "completed":
+    case "accepted":
+    case "aggregated":
+    case "healthy":
+      return "ok";
+    case "starting":
+    case "waiting":
+    case "paused":
+    case "stale":
+    case "skipped":
+    case "degraded":
+      return "warn";
+    case "error":
+    case "failed":
+    case "rejected":
+    case "offline":
+    case "insufficient_updates":
+      return "bad";
+    case "active":
+    case "live":
+      return "accent";
+    default:
+      return "neutral";
+  }
+}
+
+export function StatusPill({
   status,
   label,
+  pulse,
 }: {
-  status: string;
+  status: string | null | undefined;
   label?: string;
+  pulse?: boolean;
 }) {
-  const tone: Tone =
-    status === "online" || status === "accepted" || status === "complete"
-      ? "emerald"
-      : status === "offline" || status === "rejected" || status === "error"
-        ? "red"
-        : status === "stale" || status === "degraded"
-          ? "amber"
-          : status === "live" || status === "connecting"
-            ? "blue"
-            : "mist";
+  const tone = statusTone(status);
   return (
     <Badge tone={tone}>
-      <Dot tone={tone} pulse={status === "online" || status === "live"} />
-      {label ?? status}
+      <Dot tone={tone} pulse={pulse ?? tone === "ok"} />
+      {(label ?? status ?? "unknown").replace(/_/g, " ")}
     </Badge>
   );
 }
 
-export function Kpi({
+export function Metric({
   label,
   value,
   hint,
-  icon,
-  tone,
-  trend,
+  tone = "neutral",
+  className = "",
 }: {
-  label: string;
+  label: ReactNode;
   value: ReactNode;
   hint?: ReactNode;
-  icon?: ReactNode;
   tone?: Tone;
-  trend?: { direction: "up" | "down"; value: string; good?: boolean };
+  className?: string;
 }) {
-  const accent = tone ? toneClasses[tone].text : "text-mist-500";
   return (
-    <div className="panel px-4 py-3.5">
-      <div className="flex items-start justify-between gap-2">
-        <span className="label">{label}</span>
-        {icon ? <span className={accent}>{icon}</span> : null}
-      </div>
-      <div className="mt-2 flex items-baseline gap-2">
-        <span className="metric">{value}</span>
-        {trend ? (
-          <span
-            className={`inline-flex items-center gap-0.5 text-[11px] font-medium ${
-              trend.good === false ? "text-signal-red" : "text-signal-emerald"
-            }`}
-          >
-            {trend.direction === "up" ? (
-              <ArrowUpRight size={12} />
-            ) : (
-              <ArrowDownRight size={12} />
-            )}
-            {trend.value}
-          </span>
-        ) : null}
-      </div>
-      {hint ? <div className="mt-1.5 text-[11px] leading-snug text-mist-500">{hint}</div> : null}
-    </div>
-  );
-}
-
-export function SummaryRow({ label, value }: { label: string; value: ReactNode }) {
-  return (
-    <div className="rounded-lg border border-ink-700/60 bg-ink-800/50 px-2.5 py-2">
+    <div className={`border-line/80 px-4 py-3 ${className}`}>
       <div className="label">{label}</div>
-      <div className="mono mt-1 text-sm font-semibold text-mist-100">{value}</div>
-    </div>
-  );
-}
-
-export function ModelCard({
-  title,
-  record,
-}: {
-  title: string;
-  record: ModelRecord | null;
-}) {
-  const parameters = record?.parameters ?? null;
-  const transferBytes = parameters === null ? null : parameters * 4;
-
-  return (
-    <article className="panel px-4 py-4">
-      <div className="flex items-baseline justify-between gap-2">
-        <h4 className="text-[12px] font-semibold text-mist-100">{title}</h4>
-        <span className="chip bg-ink-800 text-mist-500">
-          {record?.has_weights ? "weights on disk" : "metadata only"}
-        </span>
+      <div className={`mt-2 flex items-baseline gap-2 ${toneStyle[tone].text}`}>
+        <span className="metric">{value}</span>
       </div>
-      <dl className="mt-3 space-y-1.5 text-[11px]">
-        <div className="flex justify-between gap-3">
-          <dt className="text-mist-500">parameters</dt>
-          <dd className="mono text-mist-200">{formatInteger(parameters)}</dd>
-        </div>
-        <div className="flex justify-between gap-3">
-          <dt className="text-mist-500">float32 transfer</dt>
-          <dd className="mono text-mist-200">
-            {transferBytes === null ? "—" : `${formatInteger(transferBytes)} B`}
-          </dd>
-        </div>
-        <div className="flex justify-between gap-3">
-          <dt className="text-mist-500">weighted val loss</dt>
-          <dd className="mono text-mist-200">{formatNumber(record?.weighted_val_loss, 6)}</dd>
-        </div>
-        <div className="flex justify-between gap-3">
-          <dt className="text-mist-500">samples / val</dt>
-          <dd className="mono text-mist-200">
-            {formatInteger(record?.n_samples)} / {formatInteger(record?.n_val)}
-          </dd>
-        </div>
-        <div className="flex justify-between gap-3">
-          <dt className="text-mist-500">round</dt>
-          <dd className="mono text-mist-200">{formatInteger(record?.round)}</dd>
-        </div>
-        <div className="flex justify-between gap-3">
-          <dt className="text-mist-500">created</dt>
-          <dd className="mono text-right text-mist-200">{formatDateTime(record?.created_utc)}</dd>
-        </div>
-        <div className="flex justify-between gap-3">
-          <dt className="text-mist-500">sources</dt>
-          <dd className="mono text-right text-mist-200">
-            {record?.sources.length ? record.sources.join(", ") : "—"}
-          </dd>
-        </div>
-      </dl>
-    </article>
-  );
-}
-
-export function Skeleton({ className = "" }: { className?: string }) {
-  return <div className={`skeleton ${className}`} aria-hidden="true" />;
-}
-
-export function PageSkeleton({ rows = 3 }: { rows?: number }) {
-  return (
-    <div className="space-y-4" aria-busy="true" aria-label="Loading">
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        {Array.from({ length: 4 }).map((_, index) => (
-          <div key={index} className="panel px-4 py-3.5">
-            <Skeleton className="h-2.5 w-20" />
-            <Skeleton className="mt-3 h-6 w-28" />
-            <Skeleton className="mt-2 h-2 w-32" />
-          </div>
-        ))}
-      </div>
-      {Array.from({ length: rows }).map((_, index) => (
-        <div key={index} className="panel p-4">
-          <Skeleton className="h-3 w-40" />
-          <Skeleton className="mt-4 h-40 w-full" />
-        </div>
-      ))}
-    </div>
-  );
-}
-
-export function ErrorState({
-  title = "Could not load this view",
-  message,
-  onRetry,
-}: {
-  title?: string;
-  message: string;
-  onRetry?: () => void;
-}) {
-  return (
-    <div className="panel border-signal-red/25 px-5 py-8 text-center">
-      <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full border border-signal-red/30 bg-signal-redDim/40">
-        <AlertTriangle size={18} className="text-signal-red" />
-      </div>
-      <h3 className="mt-3 text-sm font-semibold text-mist-100">{title}</h3>
-      <p className="mx-auto mt-1 max-w-md text-[12px] leading-relaxed text-mist-500">
-        {message}
-      </p>
-      {onRetry ? (
-        <button className="btn mx-auto mt-4" onClick={onRetry} type="button">
-          <RotateCw size={13} />
-          Retry request
-        </button>
+      {hint ? (
+        <div className="mt-1.5 truncate text-[11px] text-ink-500">{hint}</div>
       ) : null}
     </div>
+  );
+}
+
+export function DataRow({
+  label,
+  value,
+  mono = true,
+}: {
+  label: ReactNode;
+  value: ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <div className="data-row">
+      <span className="data-key">{label}</span>
+      <span className={mono ? "data-value" : "text-right text-ink-200"}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+export function Bar({
+  value,
+  max,
+  tone = "accent",
+  height = 4,
+}: {
+  value: number;
+  max: number;
+  tone?: Tone;
+  height?: number;
+}) {
+  const pct = max > 0 ? Math.max(0, Math.min(100, (value / max) * 100)) : 0;
+  return (
+    <div
+      className="w-full overflow-hidden rounded-full bg-line"
+      style={{ height }}
+      role="progressbar"
+      aria-valuenow={Math.round(pct)}
+      aria-valuemin={0}
+      aria-valuemax={100}
+    >
+      <div
+        className={`h-full rounded-full ${toneStyle[tone].dot} transition-[width] duration-300 ease-out`}
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  );
+}
+
+export function Sparkline({
+  values,
+  width = 240,
+  height = 48,
+  tone = "#f5a524",
+}: {
+  values: (number | null)[];
+  width?: number;
+  height?: number;
+  tone?: string;
+}) {
+  const points = values.filter((value): value is number => value !== null);
+  if (points.length < 2) {
+    return (
+      <div
+        className="flex items-center justify-center border border-dashed border-line text-2xs text-ink-600"
+        style={{ width, height }}
+      >
+        no series
+      </div>
+    );
+  }
+  const min = Math.min(...points);
+  const max = Math.max(...points);
+  const span = max - min || 1;
+  const step = width / (points.length - 1);
+  const path = points
+    .map((value, index) => {
+      const x = index * step;
+      const y = height - ((value - min) / span) * (height - 4) - 2;
+      return `${index === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    <svg
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label="trend"
+    >
+      <path d={path} fill="none" stroke={tone} strokeWidth={1.5} />
+    </svg>
   );
 }
 
@@ -325,16 +297,16 @@ export function EmptyState({
 }: {
   icon?: ReactNode;
   title: string;
-  message: string;
+  message: ReactNode;
   action?: ReactNode;
 }) {
   return (
     <div className="px-5 py-10 text-center">
-      <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full border border-ink-600 bg-ink-800">
-        {icon ?? <CircleDot size={17} className="text-mist-500" />}
+      <div className="mx-auto flex h-9 w-9 items-center justify-center rounded border border-line bg-raise">
+        {icon ?? <CircleDot size={15} className="text-ink-500" />}
       </div>
-      <h3 className="mt-3 text-sm font-semibold text-mist-200">{title}</h3>
-      <p className="mx-auto mt-1 max-w-md text-[12px] leading-relaxed text-mist-500">
+      <h3 className="mt-3 text-[13px] font-medium text-ink-200">{title}</h3>
+      <p className="mx-auto mt-1 max-w-md text-[11px] leading-relaxed text-ink-500">
         {message}
       </p>
       {action ? <div className="mt-4 flex justify-center">{action}</div> : null}
@@ -342,76 +314,67 @@ export function EmptyState({
   );
 }
 
-export function SourceTag({
-  kind,
-  children,
+export function ErrorState({
+  message,
+  onRetry,
 }: {
-  kind: "live" | "registry" | "offline" | "reference" | "config";
-  children: ReactNode;
+  message: string;
+  onRetry?: () => void;
 }) {
-  const tone: Tone =
-    kind === "live"
-      ? "emerald"
-      : kind === "registry"
-        ? "blue"
-        : kind === "offline"
-          ? "violet"
-          : kind === "reference"
-            ? "amber"
-            : "mist";
-  const Icon = kind === "live" ? Radio : kind === "reference" ? AlertTriangle : CircleDot;
   return (
-    <Badge tone={tone}>
-      <Icon size={10} />
-      {children}
-    </Badge>
+    <div className="panel border-bad/30 px-5 py-8 text-center">
+      <div className="mx-auto flex h-9 w-9 items-center justify-center rounded border border-bad/30 bg-bad-soft">
+        <AlertTriangle size={16} className="text-bad" />
+      </div>
+      <h3 className="mt-3 text-[13px] font-medium text-ink-100">
+        Could not reach the control API
+      </h3>
+      <p className="mx-auto mt-1 max-w-md text-[11px] leading-relaxed text-ink-500">
+        {message}
+      </p>
+      {onRetry ? (
+        <button className="btn mx-auto mt-4" onClick={onRetry} type="button">
+          <RotateCw size={12} />
+          Retry
+        </button>
+      ) : null}
+    </div>
   );
 }
 
-export function InlineLink({
-  href,
-  children,
-}: {
-  href: string;
-  children: ReactNode;
-}) {
+export function Skeleton({ className = "" }: { className?: string }) {
   return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noreferrer"
-      className="text-signal-blue underline decoration-signal-blue/30 underline-offset-2 transition-colors hover:text-mist-100"
-    >
-      {children}
-    </a>
+    <div className={`relative overflow-hidden rounded bg-raise ${className}`}>
+      <div className="absolute inset-0 animate-sweep bg-gradient-to-r from-transparent via-white/5 to-transparent" />
+    </div>
   );
 }
 
-export function Bar({
-  value,
-  max,
-  tone = "blue",
-  height = 6,
+export function PageTitle({
+  title,
+  description,
+  actions,
+  meta,
 }: {
-  value: number;
-  max: number;
-  tone?: Tone;
-  height?: number;
+  title: string;
+  description: string;
+  actions?: ReactNode;
+  meta?: ReactNode;
 }) {
-  const pct = max > 0 ? Math.max(0, Math.min(100, (value / max) * 100)) : 0;
   return (
-    <div
-      className="w-full overflow-hidden rounded-full bg-ink-700/80"
-      style={{ height }}
-      role="progressbar"
-      aria-valuenow={Math.round(pct)}
-      aria-valuemin={0}
-      aria-valuemax={100}
-    >
-      <div
-        className={`h-full rounded-full ${toneClasses[tone].dot} transition-[width] duration-500 ease-out`}
-        style={{ width: `${pct}%` }}
-      />
+    <div className="flex flex-wrap items-end justify-between gap-4 border-b border-line pb-4">
+      <div>
+        <h1 className="text-[20px] font-medium tracking-tight text-ink-100">
+          {title}
+        </h1>
+        <p className="mt-1 max-w-2xl text-[12px] leading-relaxed text-ink-500">
+          {description}
+        </p>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        {meta}
+        {actions}
+      </div>
     </div>
   );
 }

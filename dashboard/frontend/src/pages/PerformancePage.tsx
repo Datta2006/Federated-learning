@@ -1,178 +1,176 @@
-import { useState } from "react";
-import { BarChart3, Boxes, RefreshCw, Trophy } from "lucide-react";
+import { useMemo } from "react";
+import { BarChart3, FlaskConical, LineChart as LineIcon, Target } from "lucide-react";
 import { useApi } from "../lib/useApi";
-import {
-  formatDateTime,
-  formatInteger,
-  formatNumber,
-  formatR2,
-} from "../lib/format";
-import type { MetricsPayload, ModelPayload } from "../types";
+import type { MetricsPayload } from "../types";
 import {
   Badge,
   EmptyState,
-  ErrorState,
-  Kpi,
-  PageSkeleton,
+  Metric,
   Panel,
-  PanelHeader,
-  SourceTag,
-  SummaryRow,
+  PanelHead,
+  PageTitle,
+  Sparkline,
+  StatusPill,
 } from "../components/ui";
-import { LineChart } from "../components/LineChart";
-
-type SortKey = "rmse_raw_mean" | "mae_raw_mean" | "r2_raw_mean";
+import { formatNumber } from "../lib/format";
 
 export function PerformancePage() {
-  const metrics = useApi<MetricsPayload>("/api/metrics", 10000);
-  const model = useApi<ModelPayload>("/api/model", 10000);
-  const [sortKey, setSortKey] = useState<SortKey>("rmse_raw_mean");
+  const { data, error } = useApi<MetricsPayload>("/api/metrics", 15000);
 
-  if (metrics.loading && !metrics.data) {
-    return (
-      <div className="mx-auto max-w-6xl px-4 pb-10 pt-5">
-        <PageSkeleton rows={2} />
-      </div>
+  const rows = data?.comparison ?? [];
+  const best = useMemo(() => {
+    const scored = rows.filter((row) => row.rmse_clipped_mean !== null);
+    if (scored.length === 0) return null;
+    return scored.reduce((winner, row) =>
+      (row.rmse_clipped_mean ?? Infinity) < (winner.rmse_clipped_mean ?? Infinity)
+        ? row
+        : winner,
     );
-  }
-  if (metrics.error && !metrics.data) {
-    return (
-      <div className="mx-auto max-w-6xl px-4 pb-10 pt-5">
-        <ErrorState message={metrics.error} onRetry={metrics.refresh} />
-      </div>
-    );
-  }
-  if (!metrics.data) return null;
-
-  const data = metrics.data;
-  const rows = [...data.comparison].sort((a, b) => {
-    const left = a[sortKey] ?? Number.POSITIVE_INFINITY;
-    const right = b[sortKey] ?? Number.POSITIVE_INFINITY;
-    return sortKey === "r2_raw_mean" ? right - left : left - right;
-  });
-  const best = data.comparison.find((row) => row.requested_method === "ours_federated") ??
-    data.comparison.find((row) => row.method === "federated") ??
-    data.comparison[0];
-  const lossPoints = data.loss_history
-    .filter((row) => row.weighted_val_loss !== null)
-    .map((row) => ({ x: row.round, y: row.weighted_val_loss }));
+  }, [rows]);
 
   return (
-    <div className="mx-auto max-w-6xl space-y-4 px-4 pb-10 pt-5">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <SourceTag kind="offline">stage 4 evaluation</SourceTag>
-          <Badge tone={data.available ? "emerald" : "amber"}>
-            {data.available ? "results available" : "no results file"}
+    <div className="space-y-5">
+      <PageTitle
+        title="Performance"
+        description="Offline evaluation from the project's existing experiment files. These are not live training metrics and are never recomputed in the browser."
+        meta={
+          <Badge tone={data?.available ? "ok" : "neutral"}>
+            {data?.available ? "artifacts found" : "artifacts missing"}
           </Badge>
-        </div>
-        <button type="button" className="btn" onClick={metrics.refresh}>
-          <RefreshCw size={13} /> Refresh
-        </button>
-      </div>
+        }
+      />
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Kpi
-          label="Headline"
-          value={data.headline || "—"}
-          hint={data.notes}
-          icon={<Trophy size={15} />}
-          tone="violet"
-        />
-        <Kpi
-          label="Methods compared"
-          value={formatInteger(data.comparison.length)}
-          hint={`${data.all_methods.length} total, ${data.seed_results.length} seed runs`}
-          icon={<BarChart3 size={15} />}
-          tone="blue"
-        />
-        <Kpi
-          label="Federated RMSE"
-          value={best ? formatNumber(best.rmse_raw_mean, 3) : "—"}
-          hint={best ? `${best.label} · MAE ${formatNumber(best.mae_raw_mean, 3)}` : "—"}
-          icon={<Boxes size={15} />}
-          tone="emerald"
-        />
-        <Kpi
-          label="Latest federated loss"
-          value={formatNumber(data.loss_summary.latest, 6)}
-          hint={data.loss_summary.note}
-          icon={<Trophy size={15} />}
-          tone="amber"
-        />
+      {data?.headline ? (
+        <div className="rounded-panel border border-line bg-panel px-4 py-3 text-[12px] text-ink-300">
+          {data.headline}
+        </div>
+      ) : null}
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <Panel>
+          <PanelHead title="Best baseline" icon={<Target size={14} />} />
+          <div className="p-4">
+            <div className="text-[15px] text-ink-100">{best?.label ?? "—"}</div>
+            <div className="mt-2 grid grid-cols-3 gap-2">
+              <div>
+                <div className="label">RMSE</div>
+                <div className="mono mt-1 text-[13px] text-ink-200">
+                  {formatNumber(best?.rmse_clipped_mean, 3)}
+                </div>
+              </div>
+              <div>
+                <div className="label">MAE</div>
+                <div className="mono mt-1 text-[13px] text-ink-200">
+                  {formatNumber(best?.mae_clipped_mean, 3)}
+                </div>
+              </div>
+              <div>
+                <div className="label">R²</div>
+                <div className="mono mt-1 text-[13px] text-ink-200">
+                  {formatNumber(best?.r2_clipped_mean, 4)}
+                </div>
+              </div>
+            </div>
+            <p className="mt-3 text-[11px] leading-relaxed text-ink-500">
+              {best?.description ?? "No comparison rows were available."}
+            </p>
+          </div>
+        </Panel>
+
+        <Panel>
+          <PanelHead title="Federated validation loss" icon={<LineIcon size={14} />} />
+          <div className="p-4">
+            <Sparkline
+              values={(data?.loss_history ?? []).map((row) => row.weighted_val_loss)}
+              width={280}
+              height={56}
+            />
+            <div className="mt-3 flex items-baseline justify-between text-[11px]">
+              <span className="text-ink-500">latest</span>
+              <span className="mono text-ink-200">
+                {formatNumber(data?.loss_summary.latest, 6)}
+              </span>
+            </div>
+            <div className="mt-1 flex items-baseline justify-between text-[11px]">
+              <span className="text-ink-500">best</span>
+              <span className="mono text-ok-text">
+                {formatNumber(data?.loss_summary.best, 6)}
+              </span>
+            </div>
+            <p className="mt-3 text-[11px] text-ink-500">{data?.loss_summary.note}</p>
+          </div>
+        </Panel>
+
+        <Panel>
+          <PanelHead title="Artifact sources" icon={<FlaskConical size={14} />} />
+          <div className="space-y-2 p-4 text-[11px]">
+            {Object.entries(
+              (data?.sources ?? {}) as Record<string, string | null>,
+            ).map(([name, path]) => (
+              <div key={name} className="flex items-start justify-between gap-3">
+                <span className="text-ink-500">{name}</span>
+                <span className="mono truncate text-right text-ink-400" title={path ?? ""}>
+                  {path ?? "missing"}
+                </span>
+              </div>
+            ))}
+            <StatusPill
+              status={data?.active_registry.latest_model_version ? "complete" : "pending"}
+              label={`active registry ${data?.active_registry.latest_model_version ?? "none"}`}
+            />
+          </div>
+        </Panel>
       </div>
 
       <Panel>
-        <PanelHeader
-          title="Validation loss per federated round"
-          subtitle="Comes from the coordinator registry, not from the dashboard. Missing rounds stay gaps."
-          icon={<BarChart3 size={15} />}
-        />
-        <div className="px-4 pb-4 pt-3">
-          <LineChart
-            values={lossPoints}
-            yLabel="weighted validation loss"
-            tone="#f59e0b"
-            xLabels={lossPoints.length ? [String(lossPoints[0].x), String(lossPoints[lossPoints.length - 1].x)] : []}
-          />
-        </div>
-      </Panel>
-
-      <Panel className="overflow-hidden">
-        <PanelHeader
+        <PanelHead
           title="Method comparison"
-          subtitle="Offline Stage 4 results by seed. Click a metric to sort."
-          icon={<BarChart3 size={15} />}
-          action={
-            <select className="input w-auto py-1" value={sortKey} onChange={(event) => setSortKey(event.target.value as SortKey)}>
-              <option value="rmse_raw_mean">sort by RMSE</option>
-              <option value="mae_raw_mean">sort by MAE</option>
-              <option value="r2_raw_mean">sort by R²</option>
-            </select>
-          }
+          subtitle="Mean across seeds. Clipped metrics are the paper's evaluation convention."
+          icon={<BarChart3 size={14} />}
         />
         {rows.length === 0 ? (
           <EmptyState
-            title="No comparison results"
-            message="Run the Stage 4 evaluation to populate results.csv, then reload this page."
+            title="No comparison data"
+            message="results.csv and results_by_seed.csv were not found. The dashboard will not invent benchmark numbers."
           />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-[11px]">
-              <thead className="border-y border-ink-700/70 bg-ink-800/40 text-mist-500">
-                <tr>
-                  <th className="px-4 py-2 font-medium">method</th>
-                  <th className="px-3 py-2 font-medium">RMSE (raw)</th>
-                  <th className="px-3 py-2 font-medium">MAE (raw)</th>
-                  <th className="px-3 py-2 font-medium">R² (raw)</th>
-                  <th className="px-3 py-2 font-medium">RMSE (clipped)</th>
-                  <th className="px-3 py-2 font-medium">seeds</th>
-                  <th className="px-3 py-2 font-medium">params</th>
-                  <th className="px-3 py-2 font-medium">train time</th>
+            <table className="w-full border-collapse text-[11px]">
+              <thead>
+                <tr className="border-b border-line text-left text-2xs uppercase tracking-wide text-ink-600">
+                  <th className="px-4 py-2 font-medium">Method</th>
+                  <th className="px-4 py-2 text-right font-medium">Seeds</th>
+                  <th className="px-4 py-2 text-right font-medium">RMSE (raw)</th>
+                  <th className="px-4 py-2 text-right font-medium">MAE (raw)</th>
+                  <th className="px-4 py-2 text-right font-medium">R² (raw)</th>
+                  <th className="px-4 py-2 text-right font-medium">RMSE (clipped)</th>
+                  <th className="px-4 py-2 text-right font-medium">MAE (clipped)</th>
+                  <th className="px-4 py-2 text-right font-medium">R² (clipped)</th>
+                  <th className="px-4 py-2 text-right font-medium">Parameters</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className="mono">
                 {rows.map((row) => (
-                  <tr key={`${row.method}-${row.requested_method}`} className="border-b border-ink-700/40 last:border-0">
-                    <td className="px-4 py-2.5">
-                      <div className="flex items-center gap-2">
-                        <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: row.color || "#64748b" }} />
-                        <span className="font-medium text-mist-100">{row.label}</span>
-                      </div>
-                      <div className="text-[10px] text-mist-500">{row.description}</div>
+                  <tr
+                    key={row.method}
+                    className={`border-b border-line/60 last:border-0 ${
+                      row.method === best?.method ? "bg-ok-soft/40" : ""
+                    }`}
+                  >
+                    <td className="px-4 py-2">
+                      <span className="text-ink-200">{row.label}</span>
+                      {row.method === best?.method ? (
+                        <Badge tone="ok" className="ml-2">best</Badge>
+                      ) : null}
                     </td>
-                    <td className="px-3 py-2.5 mono text-mist-200">
-                      {formatNumber(row.rmse_raw_mean, 3)}
-                      {row.rmse_raw_std !== null ? <span className="text-mist-500"> ± {formatNumber(row.rmse_raw_std, 3)}</span> : null}
-                    </td>
-                    <td className="px-3 py-2.5 mono text-mist-300">{formatNumber(row.mae_raw_mean, 3)}</td>
-                    <td className="px-3 py-2.5 mono text-mist-300">{formatR2(row.r2_raw_mean)}</td>
-                    <td className="px-3 py-2.5 mono text-mist-300">{formatNumber(row.rmse_clipped_mean, 3)}</td>
-                    <td className="px-3 py-2.5 mono text-mist-300">{row.n_seeds ?? "—"}</td>
-                    <td className="px-3 py-2.5 mono text-mist-300">{formatInteger(row.parameters)}</td>
-                    <td className="px-3 py-2.5 mono text-mist-300">
-                      {row.train_seconds_mean === null ? "—" : `${formatNumber(row.train_seconds_mean, 1)} s`}
-                    </td>
+                    <td className="px-4 py-2 text-right text-ink-500">{row.n_seeds ?? "—"}</td>
+                    <td className="px-4 py-2 text-right text-ink-400">{formatNumber(row.rmse_raw_mean, 3)}</td>
+                    <td className="px-4 py-2 text-right text-ink-400">{formatNumber(row.mae_raw_mean, 3)}</td>
+                    <td className="px-4 py-2 text-right text-ink-400">{formatNumber(row.r2_raw_mean, 4)}</td>
+                    <td className="px-4 py-2 text-right text-ink-300">{formatNumber(row.rmse_clipped_mean, 3)}</td>
+                    <td className="px-4 py-2 text-right text-ink-300">{formatNumber(row.mae_clipped_mean, 3)}</td>
+                    <td className="px-4 py-2 text-right text-ink-300">{formatNumber(row.r2_clipped_mean, 4)}</td>
+                    <td className="px-4 py-2 text-right text-ink-500">{row.parameters ?? "—"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -181,44 +179,52 @@ export function PerformancePage() {
         )}
       </Panel>
 
-      <Panel>
-        <PanelHeader
-          title="Model registry"
-          subtitle="latest.json / best.json written by the coordinator. Best = lowest weighted validation loss."
-          icon={<Boxes size={15} />}
-          action={<button type="button" className="btn" onClick={model.refresh}><RefreshCw size={13} /> Refresh</button>}
-        />
-        {model.data ? (
-          <>
-            <div className="grid gap-3 px-5 pb-3 pt-3 sm:grid-cols-2 lg:grid-cols-4">
-              <SummaryRow label="registry source" value={model.data.source ?? "—"} />
-              <SummaryRow label="rounds" value={formatInteger(model.data.round_count)} />
-              <SummaryRow label="current round" value={formatInteger(model.data.current_round)} />
-              <SummaryRow label="parameters" value={formatInteger(model.data.transfer.parameters)} />
-            </div>
-            <div className="grid gap-3 px-5 pb-5 sm:grid-cols-2">
-              <div className="rounded-lg border border-ink-700/60 bg-ink-800/40 px-3 py-2.5">
-                <div className="label">latest</div>
-                <div className="mono mt-1 text-sm text-mist-100">{model.data.latest?.model_version ?? "—"}</div>
-                <div className="mt-1 text-[11px] text-mist-500">
-                  round {model.data.latest?.round ?? "—"} · loss {formatNumber(model.data.latest?.weighted_val_loss, 6)} ·{" "}
-                  {formatDateTime(model.data.latest?.created_utc)}
-                </div>
-              </div>
-              <div className="rounded-lg border border-ink-700/60 bg-ink-800/40 px-3 py-2.5">
-                <div className="label">best</div>
-                <div className="mono mt-1 text-sm text-signal-emerald">{model.data.best?.model_version ?? "—"}</div>
-                <div className="mt-1 text-[11px] text-mist-500">
-                  round {model.data.best?.round ?? "—"} · loss {formatNumber(model.data.best?.weighted_val_loss, 6)} ·{" "}
-                  {formatDateTime(model.data.best?.created_utc)}
-                </div>
-              </div>
-            </div>
-          </>
-        ) : (
-          <p className="px-5 py-4 text-[12px] text-mist-500">Model registry unavailable.</p>
-        )}
-      </Panel>
+      {data?.seed_results?.length ? (
+        <Panel>
+          <PanelHead title="Per-seed results" subtitle="Raw rows from results_by_seed.csv" />
+          <div className="max-h-80 overflow-auto">
+            <table className="w-full border-collapse text-[11px]">
+              <thead className="sticky top-0 bg-panel">
+                <tr className="border-b border-line text-left text-2xs uppercase tracking-wide text-ink-600">
+                  <th className="px-4 py-2 font-medium">Method</th>
+                  <th className="px-4 py-2 text-right font-medium">Seed</th>
+                  <th className="px-4 py-2 text-right font-medium">RMSE</th>
+                  <th className="px-4 py-2 text-right font-medium">MAE</th>
+                  <th className="px-4 py-2 text-right font-medium">R²</th>
+                  <th className="px-4 py-2 text-right font-medium">n test</th>
+                </tr>
+              </thead>
+              <tbody className="mono">
+                {data.seed_results.map((row) => (
+                  <tr key={`${row.method}-${row.seed}`} className="border-b border-line/60 last:border-0">
+                    <td className="px-4 py-2 text-ink-300">{row.method}</td>
+                    <td className="px-4 py-2 text-right text-ink-500">{row.seed}</td>
+                    <td className="px-4 py-2 text-right text-ink-300">{formatNumber(row.rmse_raw, 3)}</td>
+                    <td className="px-4 py-2 text-right text-ink-300">{formatNumber(row.mae_raw, 3)}</td>
+                    <td className="px-4 py-2 text-right text-ink-300">{formatNumber(row.r2_raw, 4)}</td>
+                    <td className="px-4 py-2 text-right text-ink-500">{row.n_test ?? "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      ) : null}
+
+      {data?.notes ? (
+        <p className="text-[11px] leading-relaxed text-ink-600">{data.notes}</p>
+      ) : null}
+      {error ? <p className="text-[11px] text-bad-text">{error}</p> : null}
+      <div className="grid gap-2 sm:grid-cols-3">
+        {(data?.all_methods ?? []).slice(0, 3).map((method) => (
+          <Metric
+            key={method.method}
+            label={method.short}
+            value={formatNumber(method.rmse_raw_mean, 3)}
+            hint="RMSE (raw mean)"
+          />
+        ))}
+      </div>
     </div>
   );
 }

@@ -23,6 +23,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,7 @@ from common.weight_transfer import (
 )
 from common.worker_protocol import (
     ROUND_STAGE_KEYS,
+    ROUND_STAGES,
     TrainingConfig,
     build_round_progress,
     build_round_summary,
@@ -88,6 +90,16 @@ from server.dag_runner import DAG, Task, run_dag
 
 LOGGER = logging.getLogger(__name__)
 STOP = threading.Event()
+
+
+def _iso_utc(ts: float | None = None) -> str:
+    moment = datetime.fromtimestamp(
+        time.time() if ts is None else ts, tz=timezone.utc
+    )
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+DYNAMIC_STAGE_LABELS = dict(ROUND_STAGES)
 
 ROUND_COLUMNS = [
     "round",
@@ -472,9 +484,22 @@ class FederatedServer:
             "message": "Coordinator ready",
             "latest_model_version": None,
             "started_utc": None,
+            "total_rounds": None,
+            "last_control": None,
+            "accepted_total": 0,
         }
         self._round_stages: dict[str, str] = {}
         self._round_selected: list[str] = []
+        self._round_timeline: list[dict[str, Any]] = []
+        self._round_stage_times: dict[str, dict[str, Any]] = {}
+        self._round_started_utc: str | None = None
+        self._round_aggregation_seconds: float | None = None
+        self._round_contributions: list[dict[str, Any]] = []
+        self._round_accepted_samples = 0
+        self._last_progress_message: dict[str, Any] | None = None
+        self._last_summary_message: dict[str, Any] | None = None
+        self._last_progress_topic: str | None = None
+        self._last_summary_topic: str | None = None
 
         self.latest_version: str | None = None
         self.latest_weights: np.ndarray | None = None
@@ -542,6 +567,13 @@ class FederatedServer:
             )
         client.subscribe(topics)
         self._connected.set()
+        if self.control_mode:
+            # Never block the paho callback: republish the retained session a
+            # moment after reconnect so a fresh subscriber sees coordinator
+            # state even if the broker restarted and lost retained messages.
+            timer = threading.Timer(0.2, self._republish_state)
+            timer.daemon = True
+            timer.start()
 
     def _on_message(
         self, client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage
@@ -677,6 +709,10 @@ class FederatedServer:
             message=session["message"],
             latest_model_version=session.get("latest_model_version")
             or self.latest_version,
+            started_utc=session.get("started_utc"),
+            total_rounds=session.get("total_rounds"),
+            last_control=session.get("last_control"),
+            accepted_total=int(session.get("accepted_total") or 0),
         )
         try:
             info = publish_json(
@@ -690,10 +726,69 @@ class FederatedServer:
         except (TypeError, ValueError) as exc:  # pragma: no cover - paho edge
             LOGGER.warning("could not publish session state: %s", exc)
 
+    def _republish_state(self) -> None:
+        """Restore every retained snapshot after a broker (re)connect.
+
+        Session-only recovery left the dashboard falling back to registry
+        history after a broker restart, losing stage timings and FedAvg
+        contributions.  Re-publishing the last progress and summary keeps the
+        authoritative view intact.
+        """
+        self._publish_session()
+        for topic, message in (
+            (self._last_progress_topic, self._last_progress_message),
+            (self._last_summary_topic, self._last_summary_message),
+        ):
+            if not topic or message is None or self.client is None:
+                continue
+            try:
+                publish_json(
+                    self.client, topic, message, qos=self.qos, retain=True
+                )
+            except (TypeError, ValueError) as exc:  # pragma: no cover
+                LOGGER.warning("could not republish %s: %s", topic, exc)
+
     def _set_session(self, **fields: Any) -> None:
         with self._session_lock:
             self._session.update(fields)
         self._publish_session()
+
+    def _record_stage(self, stage: str, status: str, detail: str | None) -> None:
+        """Maintain a monotonic stage timeline and per-stage durations."""
+        now = time.time()
+        times = self._round_stage_times.setdefault(
+            stage, {"started_utc": None, "ended_utc": None, "seconds": None}
+        )
+        if status in {"active", "pending"} and times.get("started_utc") is None:
+            times["started_utc"] = _iso_utc(now)
+        if status in {"complete", "failed", "skipped"} and times.get("ended_utc") is None:
+            times["ended_utc"] = _iso_utc(now)
+            started = times.get("started_utc")
+            if started:
+                try:
+                    started_ts = datetime.fromisoformat(
+                        str(started).replace("Z", "+00:00")
+                    ).timestamp()
+                    times["seconds"] = round(max(0.0, now - started_ts), 3)
+                except ValueError:
+                    times["seconds"] = None
+        if self._round_timeline and self._round_timeline[-1].get("stage") == stage:
+            last = self._round_timeline[-1]
+            if last.get("status") == status:
+                return
+            last.update({"status": status, "at": _iso_utc(now)})
+            if detail:
+                last["detail"] = detail
+            return
+        self._round_timeline.append(
+            {
+                "stage": stage,
+                "label": DYNAMIC_STAGE_LABELS.get(stage, stage),
+                "status": status,
+                "at": _iso_utc(now),
+                "detail": detail,
+            }
+        )
 
     def _publish_progress(
         self,
@@ -710,6 +805,7 @@ class FederatedServer:
             return
         if stages is not None:
             self._round_stages = dict(stages)
+        self._record_stage(stage, status, detail)
         collector = self._collector
         accepted = sorted(collector.accepted) if collector else []
         rejected = dict(collector.rejected) if collector else {}
@@ -729,15 +825,29 @@ class FederatedServer:
             bytes_down=bytes_down,
             single_client=len(self._round_selected) == 1,
             detail=detail,
+            timeline=list(self._round_timeline),
+            stage_times=dict(self._round_stage_times),
+            accepted_samples=self._round_accepted_samples,
+            contributions=list(self._round_contributions),
+            aggregation_seconds=self._round_aggregation_seconds,
+            registered_version=(
+                self.latest_version
+                if self._round_stages.get("model_registration") == "complete"
+                else None
+            ),
+            round_started_utc=self._round_started_utc,
         )
+        topic = round_progress_topic(self.base_topic, self._current_round)
         try:
             publish_json(
                 self.client,
-                round_progress_topic(self.base_topic, self._current_round),
+                topic,
                 message,
                 qos=self.qos,
                 retain=True,
             )
+            self._last_progress_topic = topic
+            self._last_progress_message = message
         except (TypeError, ValueError) as exc:  # pragma: no cover
             LOGGER.warning("could not publish round progress: %s", exc)
 
@@ -769,15 +879,27 @@ class FederatedServer:
             single_client=outcome.single_client,
             aggregated=outcome.aggregated,
             config=(self._session.get("config") or {}),
+            received=outcome.received,
+            contributions=list(self._round_contributions),
+            timings={
+                "stage_times": dict(self._round_stage_times),
+                "round_started_utc": self._round_started_utc,
+                "seconds": round(float(outcome.seconds), 3),
+                "aggregation_seconds": self._round_aggregation_seconds,
+                "total_samples": self._round_accepted_samples,
+            },
         )
+        topic = round_summary_topic(self.base_topic, outcome.round_number)
         try:
             publish_json(
                 self.client,
-                round_summary_topic(self.base_topic, outcome.round_number),
+                topic,
                 message,
                 qos=self.qos,
                 retain=True,
             )
+            self._last_summary_topic = topic
+            self._last_summary_message = message
         except (TypeError, ValueError) as exc:  # pragma: no cover
             LOGGER.warning("could not publish round summary: %s", exc)
 
@@ -1421,6 +1543,12 @@ class FederatedServer:
         self._round_bytes_down = 0
         self._round_selected = []
         self._round_stages = {key: "pending" for key in ROUND_STAGE_KEYS}
+        self._round_timeline = []
+        self._round_stage_times = {}
+        self._round_started_utc = _iso_utc()
+        self._round_aggregation_seconds = None
+        self._round_contributions = []
+        self._round_accepted_samples = 0
         self.local_epochs = config.local_epochs
         self.learning_rate = config.learning_rate
 
@@ -1505,6 +1633,26 @@ class FederatedServer:
         self._collect_round(self._collector, deadline_monotonic)
         collector = self._collector
         accepted = list(collector.accepted.values())
+        total_samples = sum(int(update.n_samples) for update in accepted)
+        self._round_accepted_samples = total_samples
+        self._round_contributions = [
+            {
+                "node_id": update.node_id,
+                "n_samples": int(update.n_samples),
+                "n_val": int(update.n_val),
+                "val_loss": (
+                    float(update.metadata.get("val_loss"))
+                    if isinstance(update.metadata.get("val_loss"), (int, float))
+                    else None
+                ),
+                "weight": (
+                    round(int(update.n_samples) / total_samples, 6)
+                    if total_samples
+                    else None
+                ),
+            }
+            for update in sorted(accepted, key=lambda item: item.node_id)
+        ]
         outcome = RoundOutcome(
             round_number=round_number,
             selected=list(selected),
@@ -1573,11 +1721,16 @@ class FederatedServer:
                 else f"Sample-weighted FedAvg over {len(accepted)} update(s)"
             ),
         )
+        aggregation_started = time.monotonic()
         weights = fedavg(
             [update.weights for update in accepted],
             [update.n_samples for update in accepted],
         )
+        self._round_aggregation_seconds = round(
+            time.monotonic() - aggregation_started, 3
+        )
         total_samples = sum(update.n_samples for update in accepted)
+        self._round_accepted_samples = total_samples
         self._round_stages["aggregation"] = "complete"
         self._publish_progress(
             stage="aggregation",
@@ -1669,13 +1822,13 @@ class FederatedServer:
         )
         del config
 
-    def _run_session(self, config: TrainingConfig) -> None:
-        session_id = f"sess-{uuid.uuid4().hex[:12]}"
+    def _run_session(self, config: TrainingConfig, session_id: str) -> None:
         self._session_stop.clear()
         self._session_paused.clear()
         start_round = int(self.latest_record.get("round", 0)) + 1
         executed = 0
         completed = 0
+        accepted_total = 0
         with self._session_lock:
             self._session.update(
                 {
@@ -1684,8 +1837,11 @@ class FederatedServer:
                     "config": config.to_dict(),
                     "round": None,
                     "completed_rounds": 0,
+                    "accepted_total": 0,
                     "message": f"Waiting for at least {config.min_workers} worker(s)",
                     "latest_model_version": self.latest_version,
+                    "started_utc": self._session.get("started_utc") or _iso_utc(),
+                    "total_rounds": config.rounds if config.mode == "fixed" else None,
                 }
             )
         self._publish_session()
@@ -1719,10 +1875,12 @@ class FederatedServer:
                 executed += 1
                 if outcome.status == "completed":
                     completed += 1
+                accepted_total += len(outcome.accepted)
                 with self._session_lock:
                     self._session.update(
                         {
                             "completed_rounds": completed,
+                            "accepted_total": accepted_total,
                             "latest_model_version": self.latest_version,
                             "message": (
                                 f"Round {round_number}: {outcome.status} "
@@ -1753,8 +1911,20 @@ class FederatedServer:
 
     def _handle_control_command(self, message: dict[str, Any]) -> None:
         command = message["command"]
+        received = {
+            "command": command,
+            "request_id": message.get("request_id"),
+            "at": _iso_utc(),
+        }
+        with self._session_lock:
+            self._session["last_control"] = received
         thread = self._session_thread
         running = thread is not None and thread.is_alive()
+        if command == "ping_session":
+            # Liveness probe: echo the request id and republish the current
+            # snapshot so the dashboard can confirm the subscription works.
+            self._publish_session()
+            return
         if command == "start_session":
             if running:
                 self._set_session(
@@ -1767,9 +1937,35 @@ class FederatedServer:
             except (TypeError, ValueError) as exc:
                 self._set_session(state="error", message=f"Invalid config: {exc}")
                 return
+            # Allocate the identity and publish an accepted snapshot *before*
+            # the worker thread starts.  The dashboard waits for this record
+            # (matched by request_id) instead of trusting the HTTP publish.
+            session_id = f"sess-{uuid.uuid4().hex[:12]}"
+            with self._session_lock:
+                self._session.update(
+                    {
+                        "session_id": session_id,
+                        "state": "starting",
+                        "config": config.to_dict(),
+                        "round": None,
+                        "completed_rounds": 0,
+                        "accepted_total": 0,
+                        "message": (
+                            "Session accepted; waiting for at least "
+                            f"{config.min_workers} worker(s)"
+                        ),
+                        "latest_model_version": self.latest_version,
+                        "started_utc": _iso_utc(),
+                        "total_rounds": (
+                            config.rounds if config.mode == "fixed" else None
+                        ),
+                        "last_control": received,
+                    }
+                )
+            self._publish_session()
             self._session_thread = threading.Thread(
                 target=self._run_session,
-                args=(config,),
+                args=(config, session_id),
                 name="fl-dynamic-session",
                 daemon=True,
             )
@@ -1817,8 +2013,15 @@ class FederatedServer:
             deadline = (
                 time.monotonic() + self.run_seconds if self.run_seconds else None
             )
+            last_heartbeat = 0.0
             while not STOP.is_set():
                 self._drain_inbox()
+                # Re-publish the retained session periodically.  This repairs
+                # state after a broker restart that dropped retained messages
+                # and gives the dashboard a bounded freshness signal.
+                if time.monotonic() - last_heartbeat >= 5.0:
+                    self._publish_session()
+                    last_heartbeat = time.monotonic()
                 try:
                     message = self._control_events.get_nowait()
                 except queue.Empty:

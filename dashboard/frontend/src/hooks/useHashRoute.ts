@@ -4,8 +4,9 @@ export const ROUTES = [
   "overview",
   "workers",
   "federated",
-  "air",
+  "global-models",
   "performance",
+  "air",
   "communication",
 ] as const;
 
