@@ -644,3 +644,157 @@ export interface SocketState {
   lastMessageAt: string | null;
   retryInMs: number | null;
 }
+
+// --------------------------------------------------------- network simulator
+export interface NetworkPosition {
+  x: number;
+  y: number;
+  location: string | null;
+}
+
+export interface NetworkSensorReading {
+  timestamp: string;
+  pm25: number;
+  pm10: number;
+  temperature_c: number;
+  humidity_pct: number;
+  units: Record<string, string>;
+  simulated: boolean;
+  source: string;
+  label: string;
+}
+
+export interface NetworkSensorNode {
+  node_id: string;
+  name: string;
+  node_type: "sensor";
+  gateway_id: string | null;
+  position: NetworkPosition;
+  available: boolean;
+  battery_level: number;
+  transmission_range_m: number;
+  neighbors: string[];
+  last_seen: string | null;
+  data_source: string;
+  reading_count: number;
+  latest_reading: NetworkSensorReading | null;
+}
+
+export interface NetworkStorageStatus {
+  capacity_mb: number;
+  used_mb: number;
+  used_pct: number;
+  status: string;
+}
+
+export interface NetworkGatewayHealth {
+  status: string;
+  cpu_load_pct: number;
+  memory_used_pct: number;
+  uptime_sec: number;
+  error_count: number;
+  last_heartbeat: string | null;
+}
+
+export interface NetworkGatewayNode {
+  node_id: string;
+  gateway_id: string;
+  name: string;
+  node_type: "gateway";
+  position: NetworkPosition;
+  available: boolean;
+  transmission_range_m: number;
+  neighbors: string[];
+  connected_sensor_count: number;
+  local_storage: NetworkStorageStatus;
+  health: NetworkGatewayHealth;
+  last_seen: string | null;
+}
+
+export type NetworkNode = NetworkSensorNode | NetworkGatewayNode;
+
+export interface NetworkLink {
+  link_id: string;
+  source: string;
+  destination: string;
+  quality: number;
+  etx: number;
+  latency_ms: number;
+  packet_loss: number;
+  available: boolean;
+  bandwidth_kbps: number;
+  bidirectional: boolean;
+  direction: "bidirectional" | "directional";
+  last_updated: string;
+}
+
+export interface NetworkCounts {
+  nodes: number;
+  sensors: number;
+  gateways: number;
+  links: number;
+  online_sensors: number;
+  online_gateways: number;
+  available_links: number;
+  readings: number;
+}
+
+export interface NetworkTopology {
+  name: string;
+  description: string;
+  counts: NetworkCounts;
+  nodes: NetworkNode[];
+  sensors: NetworkSensorNode[];
+  gateways: NetworkGatewayNode[];
+  links: NetworkLink[];
+  gateway_assignments: Record<string, string[]>;
+}
+
+export interface NetworkSimulationStatus {
+  running: boolean;
+  state: "running" | "stopped";
+  simulated_time: string;
+  simulation_epoch: string;
+  tick_count: number;
+  reading_total: number;
+  started_at: string | null;
+  stopped_at: string | null;
+  topology_name: string;
+  config: {
+    interval_seconds: number;
+    seed: number;
+    history_limit: number;
+    auto_generate_readings: boolean;
+    battery_drain_pct_per_hour: number;
+    node_failure_probability: number;
+    link_failure_probability: number;
+  };
+  counts: NetworkCounts;
+  note: string;
+}
+
+export interface NetworkSnapshot {
+  simulation: NetworkSimulationStatus;
+  topology: NetworkTopology;
+}
+
+export interface NetworkConfigPayload {
+  simulation: NetworkSimulationStatus["config"];
+  sensor_data: {
+    pm25_volatility: number;
+    pm10_volatility: number;
+    temperature_volatility: number;
+    humidity_volatility: number;
+    mean_reversion: number;
+  };
+  topology: {
+    name: string;
+    description: string;
+    gateway_count: number;
+    sensor_count: number;
+    link_count: number;
+  };
+  ranges: Record<string, unknown>;
+  note: string;
+}
+

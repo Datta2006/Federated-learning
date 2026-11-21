@@ -24,6 +24,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from common.worker_protocol import ROUND_STAGES, ProtocolError, TrainingConfig
+from simulator.api import create_network_router
+from simulator.engine import NetworkSimulator
 
 from .air_quality import AirQualityReader
 from .control import ControlError, ControlPublisher
@@ -90,6 +92,7 @@ class AppState:
     processes: ProcessManager
     controller: ControlPublisher
     started_at: str
+    simulator: NetworkSimulator
 
     def registry_snapshot(self) -> dict[str, Any]:
         # An explicitly configured registry (env var, constructor argument, or
@@ -158,6 +161,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         base_topic=resolved.base_topic,
         qos=resolved.mqtt_qos,
     )
+    network_simulator = NetworkSimulator()
     state = AppState(
         settings=resolved,
         registry=registry,
@@ -168,6 +172,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         processes=processes,
         controller=controller,
         started_at=_utc_now(),
+        simulator=network_simulator,
     )
 
     @asynccontextmanager
@@ -181,11 +186,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await asyncio.sleep(10.0)
                 hub.publish_threadsafe({"type": "tick", "at": _utc_now()})
 
+        async def simulation_ticker() -> None:
+            while True:
+                await asyncio.sleep(1.0)
+                try:
+                    state.simulator.advance_if_running(1.0)
+                except ValueError:
+                    # A malformed simulation config must not take down the API.
+                    state.simulator.stop()
+
         task = asyncio.create_task(ticker())
+        simulation_task = asyncio.create_task(simulation_ticker())
         try:
             yield
         finally:
             task.cancel()
+            simulation_task.cancel()
             observer.stop()
             processes.stop_all()
 
@@ -199,9 +215,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["*"],
     )
+    app.include_router(create_network_router(state.simulator))
 
     def state_of(app: FastAPI) -> AppState:
         return app.state.airfed
@@ -813,6 +830,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "/api/metrics",
                     "/api/air-quality",
                     "/api/communication",
+                    "/api/network/topology",
+                    "/api/network/status",
                     "/ws",
                 ],
             }

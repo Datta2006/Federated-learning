@@ -11,6 +11,7 @@ import {
   Radio,
   RefreshCw,
   TrendingUp,
+  Waypoints,
   Wind,
   X,
 } from "lucide-react";
@@ -27,10 +28,12 @@ import { GlobalModelsPage } from "./pages/GlobalModelsPage";
 import { AirQualityPage } from "./pages/AirQualityPage";
 import { PerformancePage } from "./pages/PerformancePage";
 import { CommunicationPage } from "./pages/CommunicationPage";
+import { NetworkPage } from "./pages/NetworkPage";
 
 const NAV: { key: Route; label: string; icon: LucideIcon }[] = [
   { key: "overview", label: "Overview", icon: LayoutDashboard },
   { key: "workers", label: "Workers", icon: Cpu },
+  { key: "network", label: "Network", icon: Waypoints },
   { key: "federated", label: "Federated", icon: Network },
   { key: "global-models", label: "Global models", icon: Boxes },
   { key: "performance", label: "Performance", icon: TrendingUp },
@@ -41,6 +44,7 @@ const NAV: { key: Route; label: string; icon: LucideIcon }[] = [
 const PAGES: Record<Route, ComponentType> = {
   overview: OverviewPage,
   workers: WorkersPage,
+  network: NetworkPage,
   federated: FederatedPage,
   "global-models": GlobalModelsPage,
   performance: PerformancePage,

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 export const ROUTES = [
   "overview",
   "workers",
+  "network",
   "federated",
   "global-models",
   "performance",
