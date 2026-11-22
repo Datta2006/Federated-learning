@@ -23,6 +23,8 @@ from simulator.entities import (
     utc_now_iso,
 )
 from simulator.links import NetworkLink
+from simulator.entities import SensorReading
+from simulator.gateway import Gateway, create_gateway
 from simulator.rpl import create_rpl_engine, RPLEngine
 from simulator.sensor_data import SensorDataConfig, SensorDataGenerator
 from simulator.topology_config import build_topology, default_topology_config
@@ -145,6 +147,11 @@ class NetworkSimulator:
         self._trickle_timers: dict[str, dict[str, TrickleTimer]] = {}  # node_id -> {dodag_id: timer}
         self._dio_params = create_trickle_params_for_dio()
 
+        # Gateway instances
+        self._gateways: dict[str, Gateway] = {}
+        self._mqtt_broker_host = "localhost"
+        self._mqtt_broker_port = 1883
+
         self._ensure_generators()
         self._initialize_rpl()
 
@@ -189,8 +196,52 @@ class NetworkSimulator:
             return self._running
 
     # --------------------------------------------------------------- clock
+    def _forward_sensor_readings(self, now: float) -> None:
+        """Forward sensor readings to gateways via RPL upward routes."""
+        import time
+        for gateway in self._gateways.values():
+            if not gateway.gateway_node.available:
+                continue
+
+            sensors = gateway.device_manager.list_sensors(active_only=True)
+
+            for sensor_reg in sensors:
+                sensor_id = sensor_reg.node_id
+                sensor = self.topology.get_sensor(sensor_id)
+
+                if not sensor.available or not sensor.latest_reading:
+                    continue
+
+                # Forward reading to gateway via RPL upward route
+                reading = sensor.latest_reading
+                route = gateway.forwarding.get_upward_route(sensor_id)
+
+                if route and len(route) >= 2 and route[-1] == gateway.gateway_id:
+                    # Route exists - deliver to gateway
+                    gateway.receive_sensor_telemetry(sensor_id, reading, route)
+
+                    # Mark as forwarded in local storage
+                    gateway.local_storage.mark_forwarded(sensor_id, time.time())
+
+    def _process_gateway_outbound(self, now: float) -> None:
+        """Process gateway outbound telemetry (MQTT publishing) and health checks."""
+        for gateway in self._gateways.values():
+            if not gateway.gateway_node.available:
+                continue
+
+            # Process pending telemetry for MQTT publishing
+            gateway.process_outbound_telemetry()
+
+            # Check network health and trigger repairs
+            gateway.check_network_health(now)
+
+            # Publish status and health periodically
+            if self._tick_count % 6 == 0:  # Every ~30 seconds (6 * 5s)
+                gateway.publish_status()
+                gateway.publish_health()
+
     def advance(self, seconds: float | None = None) -> dict[str, Any]:
-        """Advance simulated time, generate due readings, update availability."""
+        """Advance simulated time, generate due readings, update availability, forward packets."""
         with self._lock:
             step = self.config.interval_seconds if seconds is None else float(seconds)
             if step < 0:
@@ -224,6 +275,13 @@ class NetworkSimulator:
                         )
                         self._emit_readings(timestamp)
                     self._seconds_since_reading = remainder
+
+            # Forward sensor readings to gateways via RPL routes
+            self._forward_sensor_readings(now)
+
+            # Process gateway outbound (MQTT, health checks)
+            self._process_gateway_outbound(now)
+
             self._maybe_apply_failures()
             return self.status_payload()
 
@@ -259,7 +317,22 @@ class NetworkSimulator:
                 ),
             )
             self.topology.add_gateway_node(gateway)
-            return gateway.to_dict()
+
+            # Create Gateway instance with all six components
+            gateway_instance = create_gateway(
+                gateway,
+                self.topology,
+                self.rpl_engine,
+                self._mqtt_broker_host,
+                self._mqtt_broker_port,
+            )
+            self._gateways[assigned_id] = gateway_instance
+
+            # Initialize DODAG for this gateway
+            gateway_instance.initialize_dodag()
+            self._init_trickle_for_node(assigned_id, gateway_instance.dodag_id)
+
+            return gateway_instance.to_dict()
 
     def create_sensor_node(
         self,
@@ -296,6 +369,12 @@ class NetworkSimulator:
             node = self.topology.remove_node(node_id)
             self._generators.pop(node_id, None)
             self._history.pop(node_id, None)
+
+            # Remove gateway instance if it was a gateway
+            if node_id in self._gateways:
+                gateway = self._gateways.pop(node_id)
+                gateway.stop()
+
             return node.to_dict()
 
     def set_node_availability(
@@ -641,44 +720,6 @@ class NetworkSimulator:
                 # Update routing tables via DAO propagation (simplified)
                 # In a full implementation, DAOs would be sent up the tree
                 # For now, compute routes on demand
-
-    def advance(self, seconds: float | None = None) -> dict[str, Any]:
-        """Advance simulated time, generate due readings, update availability."""
-        with self._lock:
-            step = self.config.interval_seconds if seconds is None else float(seconds)
-            if step < 0:
-                raise ValueError("simulation time cannot move backwards")
-            if step == 0:
-                return self.status_payload()
-
-            self._simulated_time += timedelta(seconds=step)
-            self._tick_count += 1
-            self._drain_batteries(step)
-            self._refresh_health(step)
-            self._refresh_availability_timestamps()
-
-            # RPL/Trickle processing
-            now = self._tick_count * self.config.interval_seconds
-            self._process_trickle_timers(now)
-            self._update_rpl_state(now)
-
-            if self.config.auto_generate_readings:
-                self._seconds_since_reading += step
-                due = int(self._seconds_since_reading // self.config.interval_seconds)
-                if due > 0:
-                    remainder = self._seconds_since_reading % (
-                        self.config.interval_seconds
-                    )
-                    newest_due = self._simulated_time - timedelta(seconds=remainder)
-                    # Emit at interval boundaries, oldest first.
-                    for index in range(due):
-                        timestamp = newest_due - timedelta(
-                            seconds=self.config.interval_seconds * (due - 1 - index)
-                        )
-                        self._emit_readings(timestamp)
-                    self._seconds_since_reading = remainder
-            self._maybe_apply_failures()
-            return self.status_payload()
 
     def _next_id(self, prefix: str) -> str:
         highest = 0
