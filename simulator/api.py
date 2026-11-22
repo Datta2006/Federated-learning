@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from simulator.engine import NetworkSimulator
 from simulator.entities import Position
+from simulator.rpl import DODAGConfiguration, DODAGMode, OCPOption, RPLMessageType
 
 
 class PositionModel(BaseModel):
@@ -244,6 +245,80 @@ def create_network_router(simulator: NetworkSimulator) -> APIRouter:
         except ValueError as exc:
             raise _failed(exc) from exc
         return {"ok": True, "link": link}
+
+    # ------------------------------ RPL/Trickle endpoints
+    @router.get("/rpl/state/{node_id}")
+    def rpl_state(node_id: str) -> dict[str, Any]:
+        """Get complete RPL state for a node (rank, parents, routes)."""
+        return simulator.get_rpl_state(node_id)
+
+    @router.get("/rpl/state")
+    def all_rpl_state() -> dict[str, Any]:
+        """Get RPL state for all nodes and DODAGs."""
+        return simulator.get_all_rpl_state()
+
+    @router.get("/rpl/dodag/{dodag_id}")
+    def dodag_summary(dodag_id: str) -> dict[str, Any]:
+        """Get summary of a DODAG."""
+        return simulator.get_dodag_summary(dodag_id)
+
+    @router.get("/rpl/route/{source}/{destination}")
+    def rpl_route(source: str, destination: str) -> dict[str, Any]:
+        """Compute RPL route between two nodes."""
+        with simulator._lock:
+            route = simulator.rpl_engine.compute_downward_route(source, destination)
+            if route is None:
+                # Try upward route
+                for dodag_id in simulator.rpl_engine.dodag_configs:
+                    upward = simulator.rpl_engine.compute_upward_route(source, dodag_id)
+                    if destination in upward:
+                        return {"route": upward[:upward.index(destination)+1], "type": "upward"}
+            if route:
+                return {"route": route, "type": "downward"}
+            return {"route": [], "type": "none", "error": "No route found"}
+
+    @router.get("/trickle/state/{node_id}/{dodag_id}")
+    def trickle_state(node_id: str, dodag_id: str) -> dict[str, Any]:
+        """Get Trickle timer state for a node/DODAG."""
+        state = simulator.get_trickle_state(node_id, dodag_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="Trickle timer not found")
+        return state
+
+    @router.get("/trickle/state")
+    def all_trickle_state() -> dict[str, Any]:
+        """Get Trickle state for all nodes."""
+        return simulator.get_all_trickle_state()
+
+    @router.post("/rpl/dodag")
+    def create_dodag(request: dict[str, Any]) -> dict[str, Any]:
+        """Create a new DODAG rooted at a gateway."""
+        gateway_id = request.get("gateway_id")
+        instance_id = request.get("instance_id", 0)
+        dodag_id = request.get("dodag_id")
+        if not gateway_id:
+            raise HTTPException(status_code=400, detail="gateway_id required")
+        try:
+            config = simulator.rpl_engine.initialize_dodag(gateway_id, instance_id, dodag_id)
+            simulator._init_trickle_for_node(gateway_id, config.dodag_id)
+            return {"ok": True, "config": config.__dict__}
+        except ValueError as exc:
+            raise _failed(exc) from exc
+
+    @router.post("/rpl/join/{node_id}")
+    def join_dodag(node_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """Trigger a node to join a DODAG (send DIS)."""
+        dodag_id = request.get("dodag_id")
+        if not dodag_id:
+            raise HTTPException(status_code=400, detail="dodag_id required")
+        with simulator._lock:
+            state = simulator.rpl_engine.get_or_create_node_state(node_id)
+            if dodag_id not in simulator._trickle_timers.get(node_id, {}):
+                simulator._init_trickle_for_node(node_id, dodag_id)
+            # Reset Trickle to send DIS immediately
+            timer = simulator._trickle_timers[node_id][dodag_id]
+            timer.reset(0.0)
+            return {"ok": True, "node_id": node_id, "dodag_id": dodag_id}
 
     return router
 

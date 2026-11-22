@@ -23,8 +23,10 @@ from simulator.entities import (
     utc_now_iso,
 )
 from simulator.links import NetworkLink
+from simulator.rpl import create_rpl_engine, RPLEngine
 from simulator.sensor_data import SensorDataConfig, SensorDataGenerator
 from simulator.topology_config import build_topology, default_topology_config
+from simulator.trickle import TrickleTimer, create_trickle_params_for_dio
 
 SIMULATION_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -137,7 +139,14 @@ class NetworkSimulator:
         self._stopped_at: str | None = None
         self._rng = random.Random(self.config.seed)
         self._reading_total = 0
+
+        # RPL and Trickle integration
+        self.rpl_engine: RPLEngine = create_rpl_engine(self.topology, self.config.seed)
+        self._trickle_timers: dict[str, dict[str, TrickleTimer]] = {}  # node_id -> {dodag_id: timer}
+        self._dio_params = create_trickle_params_for_dio()
+
         self._ensure_generators()
+        self._initialize_rpl()
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> dict[str, Any]:
@@ -194,6 +203,11 @@ class NetworkSimulator:
             self._drain_batteries(step)
             self._refresh_health(step)
             self._refresh_availability_timestamps()
+
+            # RPL/Trickle processing
+            now = self._tick_count * self.config.interval_seconds
+            self._process_trickle_timers(now)
+            self._update_rpl_state(now)
 
             if self.config.auto_generate_readings:
                 self._seconds_since_reading += step
@@ -548,6 +562,124 @@ class NetworkSimulator:
                     link.available = not link.available
                     link.last_updated = utc_now_iso()
 
+    def _initialize_rpl(self) -> None:
+        """Initialize RPL DODAGs for each gateway and start Trickle timers."""
+        with self._lock:
+            # Initialize DODAG for each gateway
+            for gateway in self.topology.gateway_nodes():
+                self.rpl_engine.initialize_dodag(gateway.gateway_id)
+                self._init_trickle_for_node(gateway.gateway_id, gateway.gateway_id)
+
+            # Initialize Trickle for sensors (they'll join via DIS/DIO)
+            for sensor in self.topology.sensor_nodes():
+                self._init_trickle_for_node(sensor.node_id, sensor.node_id)
+
+    def _init_trickle_for_node(self, node_id: str, dodag_id: str) -> None:
+        """Initialize Trickle timer for a node/DODAG pair."""
+        if node_id not in self._trickle_timers:
+            self._trickle_timers[node_id] = {}
+        timer = TrickleTimer(self._dio_params)
+        timer.initialize(0.0, self._dio_params)
+        self._trickle_timers[node_id][dodag_id] = timer
+
+    def _process_trickle_timers(self, now: float) -> dict[str, list]:
+        """Process all Trickle timers, return messages to send."""
+        messages = {"dio": [], "dis": [], "dao": []}
+
+        with self._lock:
+            for node_id, dodag_timers in self._trickle_timers.items():
+                for dodag_id, timer in dodag_timers.items():
+                    should_tx, interval_expired = timer.step(now)
+
+                    if should_tx:
+                        # Determine message type based on node state
+                        node_state = self.rpl_engine.nodes_state.get(node_id)
+                        if node_state and node_state.is_root:
+                            # Root sends DIO
+                            dodag_config = self.rpl_engine.dodag_configs.get(dodag_id)
+                            if dodag_config and node_state.rank:
+                                dio = dodag_config  # This needs proper DIO creation
+                                messages["dio"].append({
+                                    "source": node_id,
+                                    "dodag_id": dodag_id,
+                                    "type": "dio",
+                                })
+                        elif node_state and node_state.joined_dodag:
+                            # Joined node sends DIO
+                            messages["dio"].append({
+                                "source": node_id,
+                                "dodag_id": dodag_id,
+                                "type": "dio",
+                            })
+                        elif node_state and not node_state.joined_dodag:
+                            # Not joined - send DIS
+                            messages["dis"].append({
+                                "source": node_id,
+                                "dodag_id": dodag_id,
+                                "type": "dis",
+                            })
+
+                        timer.on_tx(now)
+
+                    if interval_expired:
+                        # Interval doubled, continue
+                        pass
+
+        return messages
+
+    def _update_rpl_state(self, now: float) -> None:
+        """Update RPL ranks and routing for all nodes."""
+        with self._lock:
+            # Process all DODAGs
+            for dodag_id in self.rpl_engine.dodag_configs:
+                # Update ranks for all nodes in this DODAG
+                for node_id in self.rpl_engine.nodes_state:
+                    state = self.rpl_engine.nodes_state[node_id]
+                    if state.dodag_id == dodag_id or (state.is_root and state.dodag_id == dodag_id):
+                        self.rpl_engine.update_node_rank(node_id, dodag_id, now)
+
+                # Update routing tables via DAO propagation (simplified)
+                # In a full implementation, DAOs would be sent up the tree
+                # For now, compute routes on demand
+
+    def advance(self, seconds: float | None = None) -> dict[str, Any]:
+        """Advance simulated time, generate due readings, update availability."""
+        with self._lock:
+            step = self.config.interval_seconds if seconds is None else float(seconds)
+            if step < 0:
+                raise ValueError("simulation time cannot move backwards")
+            if step == 0:
+                return self.status_payload()
+
+            self._simulated_time += timedelta(seconds=step)
+            self._tick_count += 1
+            self._drain_batteries(step)
+            self._refresh_health(step)
+            self._refresh_availability_timestamps()
+
+            # RPL/Trickle processing
+            now = self._tick_count * self.config.interval_seconds
+            self._process_trickle_timers(now)
+            self._update_rpl_state(now)
+
+            if self.config.auto_generate_readings:
+                self._seconds_since_reading += step
+                due = int(self._seconds_since_reading // self.config.interval_seconds)
+                if due > 0:
+                    remainder = self._seconds_since_reading % (
+                        self.config.interval_seconds
+                    )
+                    newest_due = self._simulated_time - timedelta(seconds=remainder)
+                    # Emit at interval boundaries, oldest first.
+                    for index in range(due):
+                        timestamp = newest_due - timedelta(
+                            seconds=self.config.interval_seconds * (due - 1 - index)
+                        )
+                        self._emit_readings(timestamp)
+                    self._seconds_since_reading = remainder
+            self._maybe_apply_failures()
+            return self.status_payload()
+
     def _next_id(self, prefix: str) -> str:
         highest = 0
         for node_id in (*self.topology.nodes, *self.topology.links):
@@ -555,6 +687,52 @@ class NetworkSimulator:
             if stem == prefix and suffix.isdigit():
                 highest = max(highest, int(suffix))
         return f"{prefix}-{highest + 1:02d}"
+
+    # ---------------------------- RPL/Trickle API methods
+    def get_rpl_state(self, node_id: str) -> dict[str, Any]:
+        """Get complete RPL state for a node."""
+        with self._lock:
+            return self.rpl_engine.get_node_rpl_state(node_id)
+
+    def get_dodag_summary(self, dodag_id: str) -> dict[str, Any]:
+        """Get DODAG summary."""
+        with self._lock:
+            return self.rpl_engine.get_dodag_summary(dodag_id)
+
+    def get_all_rpl_state(self) -> dict[str, Any]:
+        """Get RPL state for all nodes."""
+        with self._lock:
+            return {
+                "nodes": {
+                    node_id: self.rpl_engine.get_node_rpl_state(node_id)
+                    for node_id in self.rpl_engine.nodes_state
+                },
+                "dodags": {
+                    dodag_id: self.rpl_engine.get_dodag_summary(dodag_id)
+                    for dodag_id in self.rpl_engine.dodag_configs
+                },
+            }
+
+    def get_trickle_state(self, node_id: str, dodag_id: str) -> dict[str, Any] | None:
+        """Get Trickle timer state for a node/DODAG."""
+        with self._lock:
+            timers = self._trickle_timers.get(node_id, {})
+            timer = timers.get(dodag_id)
+            if timer:
+                now = self._tick_count * self.config.interval_seconds
+                return timer.get_state(now)
+            return None
+
+    def get_all_trickle_state(self) -> dict[str, Any]:
+        """Get Trickle state for all nodes."""
+        with self._lock:
+            now = self._tick_count * self.config.interval_seconds
+            result = {}
+            for node_id, dodag_timers in self._trickle_timers.items():
+                result[node_id] = {}
+                for dodag_id, timer in dodag_timers.items():
+                    result[node_id][dodag_id] = timer.get_state(now)
+            return result
 
 
 __all__ = ["SIMULATION_EPOCH", "NetworkSimulator", "SimulationConfig"]

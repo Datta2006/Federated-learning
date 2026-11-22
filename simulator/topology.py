@@ -139,6 +139,17 @@ class NetworkTopology:
         self.get_node(node_id)
         return [link for link in self.links.values() if link.touches(node_id)]
 
+    def get_link_between(self, node_a: str, node_b: str) -> NetworkLink | None:
+        """Get the link between two nodes, regardless of direction."""
+        self.get_node(node_a)
+        self.get_node(node_b)
+        for link in self.links.values():
+            if (link.source == node_a and link.destination == node_b) or (
+                link.bidirectional and link.source == node_b and link.destination == node_a
+            ):
+                return link
+        return None
+
     # ------------------------------------------------------------- topology
     def neighbors(self, node_id: str, available_only: bool = False) -> list[str]:
         self.get_node(node_id)

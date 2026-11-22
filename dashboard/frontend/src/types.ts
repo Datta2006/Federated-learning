@@ -798,3 +798,88 @@ export interface NetworkConfigPayload {
   note: string;
 }
 
+// --------------------------------------------------------- RPL/Trickle types
+export interface RPLRank {
+  rank: number;
+  parent_id: string | null;
+  path_etx: number;
+  hop_count: number;
+  calculated_at: string;
+}
+
+export interface RPLParentCandidate {
+  parent_id: string;
+  rank: number;
+  etx: number;
+  path_etx: number;
+  link_quality: number;
+  is_preferred: boolean;
+}
+
+export interface RPLRouteEntry {
+  destination: string;
+  next_hop: string;
+  path: string[];
+  path_etx: number;
+  hop_count: number;
+  is_upward: boolean;
+  is_downward: boolean;
+}
+
+export interface RPLNodeState {
+  node_id: string;
+  dodag_id: string;
+  rank: RPLRank | null;
+  parent_candidates: RPLParentCandidate[];
+  preferred_parent: string | null;
+  routing_table: RPLRouteEntry[];
+  joined_at: string | null;
+  is_root: boolean;
+}
+
+export interface RPLStateResponse {
+  node_id: string;
+  dodag_states: Record<string, RPLNodeState>;
+}
+
+export interface DODAGSummary {
+  dodag_id: string;
+  root_id: string;
+  instance_id: number;
+  version: number;
+  rank_factor: number;
+  min_hop_rank_increase: number;
+  max_rank_increase: number;
+  ocp: number;
+  mode: string;
+  node_count: number;
+  version_number: number;
+}
+
+export interface TrickleStateResponse {
+  node_id: string;
+  dodag_id: string;
+  interval: number;
+  interval_start: number;
+  interval_end: number;
+  c: number;
+  t: number;
+  doubled_count: number;
+  last_tx_time: number | null;
+  time_until_tx: number | null;
+  time_until_interval_end: number;
+  is_suppressed: boolean;
+  params: {
+    imin: number;
+    imax: number;
+    k: number;
+    max_doublings: number;
+  };
+}
+
+export interface RPLRouteResponse {
+  route: string[];
+  type: "upward" | "downward" | "none";
+  error?: string;
+}
+
