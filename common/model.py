@@ -99,25 +99,56 @@ def flatten_weights(model: tf.keras.Model) -> np.ndarray:
     return np.concatenate(arrays).astype(np.float32, copy=False)
 
 
-def unflatten_weights(model: tf.keras.Model, flat_weights: np.ndarray) -> None:
-    """Restore a flat float32 vector into a model with matching weight shapes."""
+def unflatten_weights(
+    model: tf.keras.Model | None,
+    flat_weights: np.ndarray,
+    shapes: list[tuple[int, ...]] | None = None,
+) -> list[np.ndarray] | None:
+    """Restore a flat float32 vector into weight arrays.
+
+    Can be used in two modes:
+    1. With a model: sets weights on the model and returns None
+    2. With shapes: returns list of weight arrays without a model
+    """
     flat = np.asarray(flat_weights, dtype=np.float32).reshape(-1)
     restored: list[np.ndarray] = []
     offset = 0
-    for weight in model.get_weights():
-        size = int(np.prod(weight.shape))
-        if offset + size > flat.size:
+
+    if model is not None:
+        # Mode 1: restore into model
+        for weight in model.get_weights():
+            size = int(np.prod(weight.shape))
+            if offset + size > flat.size:
+                raise ValueError(
+                    f"flat weight vector is too short: need at least {offset + size}, "
+                    f"got {flat.size}"
+                )
+            restored.append(flat[offset : offset + size].reshape(weight.shape))
+            offset += size
+        if offset != flat.size:
             raise ValueError(
-                f"flat weight vector is too short: need at least {offset + size}, "
-                f"got {flat.size}"
+                f"flat weight vector has {flat.size - offset} unexpected extra value(s)"
             )
-        restored.append(flat[offset : offset + size].reshape(weight.shape))
-        offset += size
-    if offset != flat.size:
-        raise ValueError(
-            f"flat weight vector has {flat.size - offset} unexpected extra value(s)"
-        )
-    model.set_weights(restored)
+        model.set_weights(restored)
+        return None
+    elif shapes is not None:
+        # Mode 2: restore using provided shapes
+        for shape in shapes:
+            size = int(np.prod(shape))
+            if offset + size > flat.size:
+                raise ValueError(
+                    f"flat weight vector is too short: need at least {offset + size}, "
+                    f"got {flat.size}"
+                )
+            restored.append(flat[offset : offset + size].reshape(shape))
+            offset += size
+        if offset != flat.size:
+            raise ValueError(
+                f"flat weight vector has {flat.size - offset} unexpected extra value(s)"
+            )
+        return restored
+    else:
+        raise ValueError("Either model or shapes must be provided")
 
 
 def model_summary(model: tf.keras.Model) -> dict[str, Any]:

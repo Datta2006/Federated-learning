@@ -34,6 +34,10 @@ from simulator.rpl import RPLEngine, RPLNodeState
 from simulator.topology import NetworkTopology
 from simulator.fl_client import FederatedLearningClient
 from simulator.fl_storage import FLStorageComponent
+from simulator.model_deployment import ModelDeploymentComponent
+from simulator.inference import InferenceComponent
+from simulator.forecasting import ForecastingComponent
+from simulator.monitoring import MonitoringComponent
 from common.mqtt_utils import (
     configure_last_will,
     create_client,
@@ -863,6 +867,38 @@ class Gateway:
         self.network_monitor = NetworkMonitor(self)
         self.forwarding = ForwardingManager(self)
 
+        # Stack 4: Edge Inference and Monitoring components
+        self.model_deployment = ModelDeploymentComponent(
+            gateway_id=self.gateway_id,
+            base_topic="aq",
+            mqtt_client=None,  # Will be set after communication connects
+            local_storage=self.local_storage,
+            expected_architecture_hash=None,
+            max_checkpoints=5,
+        )
+        self.inference = InferenceComponent(
+            gateway_id=self.gateway_id,
+            model_deployment=self.model_deployment,
+            window_hours=24,
+            horizon=1,
+        )
+        self.forecasting = ForecastingComponent(
+            gateway_id=self.gateway_id,
+            inference_component=self.inference,
+            model_deployment=self.model_deployment,
+            window_hours=24,
+            default_horizon=6,
+        )
+        self.monitoring = MonitoringComponent(
+            gateway_id=self.gateway_id,
+            mqtt_client=None,  # Will be set after communication connects
+            local_storage=self.local_storage,
+            inference_component=self.inference,
+            model_deployment=self.model_deployment,
+            collection_interval_seconds=30,
+            history_limit=1000,
+        )
+
         # Trickle timers (managed by NetworkSimulator)
         self._trickle_timers: dict[str, dict[str, Any]] = {}
 
@@ -923,8 +959,19 @@ class Gateway:
                 # Gateway can operate in offline mode
                 pass
 
+            # Wire up MQTT client for model deployment and monitoring
+            if self.communication.client:
+                self.model_deployment.mqtt_client = self.communication.client
+                self.monitoring.mqtt_client = self.communication.client
+                # Start model deployment subscription
+                self.model_deployment.start()
+
             self._running = True
             self.status = GatewayStatus.ONLINE
+
+            # Start monitoring component
+            self.monitoring.start()
+
             return True
 
     def attach_fl_client(self, client: Any) -> None:
@@ -952,6 +999,13 @@ class Gateway:
 
             self._running = False
             self.status = GatewayStatus.OFFLINE
+
+            # Stop monitoring component
+            self.monitoring.stop()
+
+            # Stop model deployment
+            self.model_deployment.stop()
+
             self.communication.disconnect()
 
     def receive_sensor_telemetry(
@@ -1014,6 +1068,11 @@ class Gateway:
                 "network_monitor": self.network_monitor.get_stats(),
                 "forwarding": self.forwarding.get_stats(),
                 "fl_storage": self.fl_storage.get_stats(),
+                # Stack 4 components
+                "model_deployment": self.model_deployment.get_stats(),
+                "inference": self.inference.get_stats(),
+                "forecasting": self.forecasting.get_stats(),
+                "monitoring": self.monitoring.get_stats(),
             }
 
     def to_dict(self) -> dict[str, Any]:
@@ -1034,6 +1093,11 @@ class Gateway:
                 self.fl_client.snapshot() if self.fl_client is not None else None
             ),
             "stats": self.get_stats(),
+            # Stack 4: Edge inference and monitoring
+            "model_deployment": self.model_deployment.snapshot() if hasattr(self, "model_deployment") else None,
+            "inference": self.inference.snapshot() if hasattr(self, "inference") else None,
+            "forecasting": self.forecasting.snapshot() if hasattr(self, "forecasting") else None,
+            "monitoring": self.monitoring.snapshot() if hasattr(self, "monitoring") else None,
         }
 
 
