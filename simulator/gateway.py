@@ -32,6 +32,8 @@ from simulator.entities import (
 import paho.mqtt.client as mqtt
 from simulator.rpl import RPLEngine, RPLNodeState
 from simulator.topology import NetworkTopology
+from simulator.fl_client import FederatedLearningClient
+from simulator.fl_storage import FLStorageComponent
 from common.mqtt_utils import (
     configure_last_will,
     create_client,
@@ -864,6 +866,16 @@ class Gateway:
         # Trickle timers (managed by NetworkSimulator)
         self._trickle_timers: dict[str, dict[str, Any]] = {}
 
+        # Optional federated-learning client (Stack 3).  This is deliberately
+        # *not* one of the six telemetry components: it owns a separate MQTT
+        # connection, a private dataset shard, and its own model.  Telemetry,
+        # RPL, Trickle, and local-storage behaviour are unchanged when it is
+        # absent.
+        self.fl_client: Any = None
+
+        # Dedicated FL state (never mixed with telemetry buffering).
+        self.fl_storage = FLStorageComponent(self.gateway_id)
+
         # Gateway status
         self.status = GatewayStatus.ONLINE
         self._lock = threading.Lock()
@@ -915,8 +927,25 @@ class Gateway:
             self.status = GatewayStatus.ONLINE
             return True
 
+    def attach_fl_client(self, client: Any) -> None:
+        """Attach a dedicated federated-learning client to this gateway."""
+        self.fl_client = client
+
+    def detach_fl_client(self) -> Any:
+        """Detach the federated-learning client without stopping it."""
+        client = self.fl_client
+        self.fl_client = None
+        return client
+
     def stop(self) -> None:
-        """Stop the gateway."""
+        """Stop the gateway and its optional FL client."""
+        fl_client = self.fl_client
+        if fl_client is not None:
+            try:
+                fl_client.stop()
+            except Exception:  # pragma: no cover - FL must not break telemetry
+                pass
+            self.fl_client = None
         with self._lock:
             if not self._running:
                 return
@@ -984,6 +1013,7 @@ class Gateway:
                 "communication": self.communication.get_stats(),
                 "network_monitor": self.network_monitor.get_stats(),
                 "forwarding": self.forwarding.get_stats(),
+                "fl_storage": self.fl_storage.get_stats(),
             }
 
     def to_dict(self) -> dict[str, Any]:
@@ -1000,6 +1030,9 @@ class Gateway:
             "storage_capacity_mb": self.gateway_node.local_storage.capacity_mb,
             "storage_used_mb": self.gateway_node.local_storage.used_mb,
             "connected_sensor_count": self.gateway_node.connected_sensor_count,
+            "fl_client": (
+                self.fl_client.snapshot() if self.fl_client is not None else None
+            ),
             "stats": self.get_stats(),
         }
 

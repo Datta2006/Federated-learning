@@ -72,6 +72,17 @@ class AdvanceRequest(BaseModel):
     seconds: float | None = Field(default=None, ge=0)
 
 
+class FlClientsStart(BaseModel):
+    gateway_ids: list[str] | None = None
+    window_hours: int | None = Field(default=None, ge=1)
+    seed: int | None = None
+    gateway_count: int | None = Field(default=None, ge=1)
+
+
+class FlClientsStop(BaseModel):
+    gateway_ids: list[str] | None = None
+
+
 def create_network_router(simulator: NetworkSimulator) -> APIRouter:
     """Build the ``/api/network`` router around one engine instance."""
     router = APIRouter(prefix="/api/network", tags=["network-simulation"])
@@ -245,6 +256,30 @@ def create_network_router(simulator: NetworkSimulator) -> APIRouter:
         except ValueError as exc:
             raise _failed(exc) from exc
         return {"ok": True, "link": link}
+
+    # ------------------------------ gateway FL client endpoints
+    @router.get("/fl/clients")
+    def fl_clients() -> dict[str, Any]:
+        return simulator.fl_clients_payload()
+
+    @router.post("/fl/clients/start")
+    def start_fl_clients(request: FlClientsStart | None = None) -> dict[str, Any]:
+        body = request or FlClientsStart()
+        try:
+            payload = simulator.start_fl_clients(
+                gateway_ids=body.gateway_ids,
+                window_hours=body.window_hours,
+                seed=body.seed,
+                gateway_count=body.gateway_count,
+            )
+        except ValueError as exc:
+            raise _failed(exc) from exc
+        return {"ok": True, **payload}
+
+    @router.post("/fl/clients/stop")
+    def stop_fl_clients(request: FlClientsStop | None = None) -> dict[str, Any]:
+        body = request or FlClientsStop()
+        return simulator.stop_fl_clients(body.gateway_ids)
 
     # ------------------------------ RPL/Trickle endpoints
     @router.get("/rpl/state/{node_id}")

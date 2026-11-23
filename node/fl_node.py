@@ -103,12 +103,24 @@ class FederatedNode:
         simulation: bool = False,
         shard_index: int | None = None,
         shard_count: int | None = None,
+        gateway_index: int | None = None,
+        gateway_count: int | None = None,
+        stop_event: threading.Event | None = None,
+        fl_storage: Any = None,
     ) -> None:
         self.config = load_config(config_path)
         self.allow_dynamic = bool(allow_dynamic)
         self.simulation = bool(simulation)
         self.shard_index = shard_index
         self.shard_count = shard_count
+        self.gateway_index = gateway_index
+        self.gateway_count = gateway_count
+        # Gateway clients run several nodes inside one process.  A shared
+        # module-level STOP event would make stopping one client stop all of
+        # them, so each in-process client receives its own event.  The CLI keeps
+        # using the module-level event so SIGINT/SIGTERM still work.
+        self._stop = stop_event if stop_event is not None else STOP
+        self.fl_storage = fl_storage
         if not self.allow_dynamic and node_id not in self.config.get("nodes", {}):
             raise ValueError(
                 f"unknown node_id {node_id!r}; "
@@ -119,6 +131,18 @@ class FederatedNode:
             raise ValueError("--shard-index is required with --simulation")
         if self.allow_dynamic and shard_count is None and self.simulation:
             raise ValueError("--shard-count is required with --simulation")
+        if self.gateway_count is not None:
+            if not self.simulation:
+                raise ValueError("gateway partitions require --simulation")
+            if int(self.gateway_count) < 1:
+                raise ValueError("gateway_count must be at least 1")
+            self.gateway_count = int(self.gateway_count)
+            self.gateway_index = int(self.gateway_index or 0)
+            if not 0 <= self.gateway_index < self.gateway_count:
+                raise ValueError(
+                    f"gateway_index {self.gateway_index} is outside "
+                    f"0..{self.gateway_count - 1}"
+                )
         mqtt_cfg = self.config.get("mqtt", {})
         self.node_id = node_id
         self.host = str(host or mqtt_cfg.get("host", "127.0.0.1"))
@@ -182,6 +206,8 @@ class FederatedNode:
 
     # ------------------------------------------------------------------ setup
     def _load_training_state(self) -> None:
+        if getattr(self, "_training_ready", False):
+            return
         if self.dummy:
             self.model_config = {}
             self._training_ready = True
@@ -195,22 +221,52 @@ class FederatedNode:
             raise ValueError("config.json needs dataset_path and scaler")
         raw = load_raw(resolve_path(self.config["dataset_path"]))
         if self.simulation:
-            from common.simulation import prepare_simulation_shard
+            if self.gateway_count is not None:
+                from common.simulation import prepare_gateway_partition
 
-            shard = prepare_simulation_shard(
-                raw,
-                self.config,
-                n_workers=int(self.shard_count or 1),
-                shard_index=int(self.shard_index or 0),
-                window_hours=self.window_hours,
-            )
+                shard = prepare_gateway_partition(
+                    raw,
+                    self.config,
+                    gateway_count=self.gateway_count,
+                    gateway_index=int(self.gateway_index or 0),
+                    window_hours=self.window_hours,
+                )
+                self.shard_index = int(shard["gateway_index"])
+                self.shard_count = int(shard["gateway_count"])
+                self._dataset_label = "gateway-simulation"
+                self._partition_info = {
+                    "worker_id": shard["worker_id"],
+                    "gateway_index": shard["gateway_index"],
+                    "gateway_count": shard["gateway_count"],
+                    "years": shard["years"],
+                    "shard_indices": shard["shard_indices"],
+                    "n_samples": shard["n_samples"],
+                    "n_val": shard["n_val"],
+                    "source_rows": shard["source_rows"],
+                    "dataset": shard["dataset"],
+                    "year": shard["year"],
+                    "partition": shard.get("partition"),
+                }
+            else:
+                from common.simulation import prepare_simulation_shard
+
+                shard = prepare_simulation_shard(
+                    raw,
+                    self.config,
+                    n_workers=int(self.shard_count or 1),
+                    shard_index=int(self.shard_index or 0),
+                    window_hours=self.window_hours,
+                )
+                year = int(shard["year"])
+                self.shard_index = int(shard["shard_index"])
+                self.shard_count = int(shard["shard_count"])
+                self._dataset_label = "simulation"
             self.prepared = shard["prepared"]
             year = int(shard["year"])
-            self.shard_index = int(shard["shard_index"])
-            self.shard_count = int(shard["shard_count"])
             self.n_samples = int(shard["n_samples"])
             self.n_val = int(shard["n_val"])
-            self._dataset_label = "simulation"
+            self.year = year
+            self.years = [int(value) for value in shard.get("years", [year])]
         else:
             from common.improved import prepare_improved_node
 
@@ -231,12 +287,25 @@ class FederatedNode:
             self.n_samples = len(self.prepared["X_train"])
             self.n_val = len(self.prepared["X_val"])
             self._dataset_label = f"year:{year}"
+            self.year = year
+            self.years = [year]
 
         self.model_config = improved_model_config(
             self.config, window_hours=self.window_hours, seed=self.seed
         )
         self.model = build_model_from_config(self.model_config)
         self._training_ready = True
+        if self.fl_storage is not None and getattr(self, "_partition_info", None):
+            try:
+                self.fl_storage.record_partition(self._partition_info)
+                self.fl_storage.write_state(
+                    worker_id=self.node_id,
+                    base_topic=self.base_topic,
+                    role=self.role,
+                    dataset=self._dataset_label,
+                )
+            except Exception:  # pragma: no cover - storage must never kill training
+                LOGGER.exception("could not persist gateway FL partition state")
         print(
             f"{self.node_id} ready: year={year} dataset={self._dataset_label} "
             f"shard={self.shard_index}/{self.shard_count} "
@@ -262,7 +331,7 @@ class FederatedNode:
         self.client.on_disconnect = self._on_disconnect
 
         backoff = 1.0
-        while not STOP.is_set():
+        while not self._stop.is_set():
             try:
                 self.client.connect(self.host, self.port, self.keepalive)
                 break
@@ -274,9 +343,9 @@ class FederatedNode:
                     exc,
                     backoff,
                 )
-                STOP.wait(backoff)
+                self._stop.wait(backoff)
                 backoff = min(backoff * 2.0, 30.0)
-        if STOP.is_set():
+        if self._stop.is_set():
             raise NodeRoundError("stopped before connecting")
         self.client.loop_start()
         if not self._connected.wait(timeout=10.0):
@@ -527,7 +596,7 @@ class FederatedNode:
         self, version: str, deadline_ts: float
     ) -> ReceivedModel:
         deadline = min(time.time() + 30.0, deadline_ts)
-        while not STOP.is_set() and time.time() < deadline:
+        while not self._stop.is_set() and time.time() < deadline:
             with self._global_lock:
                 model = self._global_model
             if model is not None:
@@ -538,7 +607,7 @@ class FederatedNode:
                     raise NodeRoundError(
                         f"round model {version} is stale; latest is {current}"
                     )
-            STOP.wait(0.05)
+            self._stop.wait(0.05)
         raise NodeRoundError(f"global model {version} was not received before the deadline")
 
     def _task_receive_model(self, context: dict[str, Any]) -> dict[str, Any]:
@@ -627,18 +696,33 @@ class FederatedNode:
             shuffle=True,
             verbose=0,
         )
+        weights = flatten_weights(self.model)
+        if self.fl_storage is not None and not self.dummy:
+            try:
+                self.fl_storage.save_checkpoint(
+                    round_number,
+                    weights,
+                    {
+                        "node_id": self.node_id,
+                        "model_version": invitation.get("model_version"),
+                        "n_samples": len(self.prepared["y_train"]),
+                        "n_val": len(self.prepared["y_val"]),
+                        "local_epochs": int(invitation.get("local_epochs", 1)),
+                    },
+                )
+            except Exception:  # pragma: no cover - storage must never kill training
+                LOGGER.exception("could not save gateway FL checkpoint")
         return {
-            "weights": flatten_weights(self.model),
+            "weights": weights,
             "n_samples": len(self.prepared["y_train"]),
         }
-
     def _task_upload(self, context: dict[str, Any]) -> dict[str, Any]:
         invitation = context["invitation"]
         round_number = int(invitation["round"])
         if time.time() > float(invitation["_deadline_ts"]):
             raise NodeRoundError("round deadline passed before upload")
         if self.upload_delay > 0:
-            STOP.wait(self.upload_delay)
+            self._stop.wait(self.upload_delay)
         if time.time() > float(invitation["_deadline_ts"]):
             raise NodeRoundError("round deadline passed before upload")
         if self.client is None:
@@ -772,6 +856,21 @@ class FederatedNode:
             )
         else:
             ack = result.context.get("ack") or {}
+            if self.fl_storage is not None:
+                try:
+                    self.fl_storage.record_round(
+                        int(invitation.get("round", 0)),
+                        {
+                            "n_samples": result.context.get("n_samples"),
+                            "n_val": result.context.get("n_val"),
+                            "val_loss": result.context.get("val_loss"),
+                            "model_version": invitation.get("model_version"),
+                            "sha256": ack.get("sha256"),
+                            "ack": ack.get("status"),
+                        },
+                    )
+                except Exception:  # pragma: no cover
+                    LOGGER.exception("could not record gateway FL round state")
             self._publish_worker_state(
                 "available",
                 phase="idle",
@@ -790,7 +889,7 @@ class FederatedNode:
         return result.success
 
     def _worker_loop(self) -> None:
-        while not STOP.is_set():
+        while not self._stop.is_set():
             try:
                 invitation = self._rounds.get(timeout=0.5)
             except queue.Empty:
@@ -823,7 +922,7 @@ class FederatedNode:
         )
 
     def run(self) -> int:
-        STOP.clear()
+        self._stop.clear()
         self._started = time.monotonic()
         if not self.inference_only:
             self._load_training_state()
@@ -837,7 +936,7 @@ class FederatedNode:
         deadline = time.monotonic() + self.run_seconds if self.run_seconds else None
         try:
             last_heartbeat = 0.0
-            while not STOP.is_set():
+            while not self._stop.is_set():
                 self._drain_inbox()
                 now = time.monotonic()
                 if deadline is not None and now >= deadline:
@@ -845,10 +944,18 @@ class FederatedNode:
                 if now - last_heartbeat >= self.heartbeat_sec:
                     self._publish_heartbeat()
                     last_heartbeat = now
-                STOP.wait(min(0.1, self.heartbeat_sec))
+                self._stop.wait(min(0.1, self.heartbeat_sec))
         finally:
-            STOP.set()
+            self._stop.set()
             if self.client is not None and self.client.is_connected():
+                # Explicit, non-retained offline state so the coordinator stops
+                # selecting this worker immediately instead of waiting for the
+                # heartbeat expiry.  This is what makes a gateway dropout a real
+                # partial-participation event.
+                try:
+                    self._publish_worker_state("offline", detail="node stopped")
+                except Exception:  # pragma: no cover - shutdown best effort
+                    LOGGER.debug("could not publish offline worker state", exc_info=True)
                 info = publish_json(
                     self.client,
                     self.status_topic,
@@ -897,6 +1004,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--shard-index", type=int, default=None)
     parser.add_argument("--shard-count", type=int, default=None)
+    parser.add_argument(
+        "--gateway-index",
+        type=int,
+        default=None,
+        help="Gateway partition index (Approach 2; requires --simulation)",
+    )
+    parser.add_argument(
+        "--gateway-count",
+        type=int,
+        default=None,
+        help="Number of gateway partitions (Approach 2; requires --simulation)",
+    )
     parser.add_argument("--verbose", action="count", default=0)
     return parser
 
@@ -935,6 +1054,8 @@ def _main() -> None:
             simulation=args.simulation,
             shard_index=args.shard_index,
             shard_count=args.shard_count,
+            gateway_index=args.gateway_index,
+            gateway_count=args.gateway_count,
         ).run()
     )
 

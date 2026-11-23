@@ -13,6 +13,7 @@ import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from simulator.entities import (
@@ -31,6 +32,13 @@ from simulator.topology_config import build_topology, default_topology_config
 from simulator.trickle import TrickleTimer, create_trickle_params_for_dio
 
 SIMULATION_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+FL_GATEWAYS_NOTE = (
+    "Each gateway is an independent FL client on a disjoint partition of the "
+    "historical training years. Raw rows never leave the gateway; only weights "
+    "and validation scalars are uploaded. Telemetry, RPL, and Trickle are "
+    "separate components and stay untouched."
+)
 
 
 def _iso(value: datetime) -> str:
@@ -152,6 +160,27 @@ class NetworkSimulator:
         self._mqtt_broker_host = "localhost"
         self._mqtt_broker_port = 1883
 
+        # Create Gateway wrapper instances for each GatewayNode in topology
+        for gateway_node in self.topology.gateway_nodes():
+            gateway_id = gateway_node.gateway_id
+            gateway_instance = create_gateway(
+                gateway_node,
+                self.topology,
+                self.rpl_engine,
+                self._mqtt_broker_host,
+                self._mqtt_broker_port,
+            )
+            gateway_instance.initialize_dodag()
+            self._gateways[gateway_id] = gateway_instance
+            self._init_trickle_for_node(gateway_id, gateway_instance.dodag_id)
+
+        # Dedicated federated-learning clients, one per gateway (Stack 3).
+        # They are intentionally independent of the telemetry components and
+        # are only created when explicitly enabled.  The fleet owns the
+        # deterministic gateway -> partition mapping, so dropping and restarting
+        # one gateway never renumbers the others.
+        self._fl_fleet: Any = None
+
         self._ensure_generators()
         self._initialize_rpl()
 
@@ -175,6 +204,7 @@ class NetworkSimulator:
 
     def reset(self) -> dict[str, Any]:
         """Return to the original configured topology and clock."""
+        self.stop_fl_clients()
         with self._lock:
             self._running = False
             self.topology = build_topology(self._topology_config)
@@ -373,6 +403,9 @@ class NetworkSimulator:
             # Remove gateway instance if it was a gateway
             if node_id in self._gateways:
                 gateway = self._gateways.pop(node_id)
+                gateway.detach_fl_client()
+                if self._fl_fleet is not None:
+                    self._fl_fleet.stop(node_id)
                 gateway.stop()
 
             return node.to_dict()
@@ -525,6 +558,7 @@ class NetworkSimulator:
             return {
                 "simulation": self.status_payload(),
                 "topology": self.topology_payload(),
+                "fl_clients": self.fl_clients_payload(),
             }
 
     def configuration_payload(self) -> dict[str, Any]:
@@ -551,6 +585,164 @@ class NetworkSimulator:
                     "are explicitly marked simulated."
                 ),
             }
+
+    # ------------------------------------------------- federated-learning clients
+    def start_fl_clients(
+        self,
+        *,
+        config_path: str | Path | None = None,
+        window_hours: int | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        seed: int | None = None,
+        gateway_ids: list[str] | None = None,
+        gateway_count: int | None = None,
+    ) -> dict[str, Any]:
+        """Start one dedicated FL client per (available) gateway.
+
+        A gateway's partition is a deterministic function of the sorted gateway
+        list, not of the order clients were started.  Stopping one gateway
+        therefore never renumbers the survivors: restarting it gives back the
+        same partition.  Each client wraps the existing ``FederatedNode`` on the
+        gateway's own MQTT connection; telemetry components are untouched.
+        """
+        from simulator.fl_client import GatewayFLFleet
+
+        with self._lock:
+            available = {
+                gateway_id: gateway
+                for gateway_id, gateway in self._gateways.items()
+                if gateway.gateway_node.available
+            }
+            if gateway_ids is not None:
+                missing = [gid for gid in gateway_ids if gid not in available]
+                if missing:
+                    raise ValueError(
+                        "no available gateway(s): " + ", ".join(sorted(missing))
+                    )
+                order = list(dict.fromkeys(gateway_ids))
+            else:
+                order = sorted(available)
+            if not order:
+                raise ValueError("the topology has no available gateways")
+            count = int(gateway_count or len(available))
+            if count < len(available):
+                raise ValueError(
+                    f"gateway_count={count} is smaller than the "
+                    f"{len(available)} available gateways"
+                )
+            fleet = self._fl_fleet
+            if fleet is None or fleet.gateway_count != count:
+                if fleet is not None and any(
+                    client.running for client in fleet._clients.values()
+                ):
+                    raise ValueError(
+                        "stop the running FL clients before changing gateway_count"
+                    )
+                fleet = GatewayFLFleet(
+                    config_path=str(config_path) if config_path else None,
+                    gateway_count=count,
+                )
+                self._fl_fleet = fleet
+
+        for gateway_id in order:
+            existing = fleet.client(gateway_id)
+            if existing is not None and existing.running:
+                available[gateway_id].attach_fl_client(existing)
+                continue
+            if existing is not None:
+                existing.stop()
+            client = fleet.start(
+                gateway_id,
+                fl_storage=available[gateway_id].fl_storage,
+                window_hours=window_hours,
+                host=host,
+                port=port,
+                seed=seed,
+            )
+            available[gateway_id].attach_fl_client(client)
+        return self.fl_clients_payload()
+
+    def stop_fl_clients(
+        self, gateway_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Stop gateway FL clients (all when ``gateway_ids`` is omitted).
+
+        Stopping is an intentional dropout: the gateway's worker state goes
+        offline and the coordinator's partial-participation rules take over.
+        The fleet keeps the gateway's partition index for a later restart.
+        """
+        with self._lock:
+            fleet = self._fl_fleet
+            if fleet is None:
+                return {"ok": True, "stopped": [], **self.fl_clients_payload()}
+            selected = (
+                list(gateway_ids)
+                if gateway_ids is not None
+                else sorted(fleet._clients)
+            )
+            gateways = dict(self._gateways)
+        stopped: list[str] = []
+        for gateway_id in selected:
+            if gateway_id not in fleet._clients:
+                continue
+            gateway = gateways.get(gateway_id)
+            if gateway is not None:
+                gateway.detach_fl_client()
+            try:
+                fleet.stop(gateway_id)
+            finally:
+                stopped.append(gateway_id)
+        return {"ok": True, "stopped": stopped, **self.fl_clients_payload()}
+
+    def fl_clients_payload(self) -> dict[str, Any]:
+        """Read-only dashboard view of every gateway FL client."""
+        with self._lock:
+            fleet = self._fl_fleet
+        if fleet is None:
+            return {
+                "available": False,
+                "count": 0,
+                "gateways": [],
+                "note": FL_GATEWAYS_NOTE,
+            }
+        stats = fleet.stats()
+        gateways: list[dict[str, Any]] = []
+        for gateway_id, client_stats in sorted(stats["clients"].items()):
+            partition = client_stats.get("partition") or {}
+            years = [int(year) for year in partition.get("years") or []]
+            gateways.append(
+                {
+                    **client_stats,
+                    "gateway_id": gateway_id,
+                    "worker_id": client_stats.get("worker_id"),
+                    "gateway_index": client_stats.get("shard_index"),
+                    "gateway_count": client_stats.get("shard_count"),
+                    "years": years,
+                    "year": years[0] if years else client_stats.get("year"),
+                    "shard_indices": partition.get("shard_indices") or [],
+                    "n_samples": int(
+                        client_stats.get("n_samples")
+                        or partition.get("n_samples")
+                        or 0
+                    ),
+                    "n_val": int(
+                        client_stats.get("n_val") or partition.get("n_val") or 0
+                    ),
+                    "source_rows": partition.get("source_rows"),
+                    "current_round": client_stats.get("current_round"),
+                    "state": client_stats.get("state"),
+                    "worker_state": client_stats.get("worker_state"),
+                }
+            )
+        return {
+            "available": bool(gateways),
+            "count": len(gateways),
+            "gateway_count": stats.get("gateway_count"),
+            "partitions": stats.get("partitions", {}),
+            "gateways": gateways,
+            "note": FL_GATEWAYS_NOTE,
+        }
 
     # -------------------------------------------------------------- internal
     def _ensure_generators(self) -> None:

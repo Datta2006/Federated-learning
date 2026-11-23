@@ -243,6 +243,69 @@ export interface TrainingConfigInput {
   worker_role: "training" | "inference";
 }
 
+export interface GatewayFlPartition {
+  worker_id?: string | null;
+  gateway_index?: number | null;
+  gateway_count?: number | null;
+  years?: number[] | null;
+  shard_indices?: number[] | null;
+  n_samples?: number | null;
+  n_val?: number | null;
+  source_rows?: number | null;
+  dataset?: string | null;
+}
+
+export interface GatewayFlStorage {
+  directory: string;
+  max_checkpoints: number;
+  checkpoint_count: number;
+  latest_checkpoint: string | null;
+  last_round: number | null;
+  partition: GatewayFlPartition | null;
+  rounds_recorded: number;
+  size_bytes: number;
+}
+
+export interface GatewayFlClient {
+  gateway_id: string;
+  worker_id: string;
+  gateway_index: number | null;
+  gateway_count: number | null;
+  state: string;
+  worker_state: string | null;
+  running: boolean;
+  current_round: number | null;
+  last_error: string | null;
+  dummy: boolean;
+  starts: number;
+  years: number[];
+  year: number | null;
+  shard_indices: number[];
+  n_samples: number;
+  n_val: number;
+  source_rows: number | null;
+  partition: GatewayFlPartition | null;
+  storage?: GatewayFlStorage | null;
+  online?: boolean;
+  live_state?: string | null;
+  aggregation_weight?: number | null;
+  latest_model_version?: string | null;
+  worker?: WorkerView | null;
+  last_contribution?: Contribution | null;
+}
+
+export interface GatewayFlPayload {
+  available: boolean;
+  count: number;
+  gateway_count?: number | null;
+  gateways: GatewayFlClient[];
+  partitions?: Record<string, number>;
+  latest_model?: ModelRecord | null;
+  last_round?: RoundSummaryView | null;
+  round_count?: number | null;
+  note?: string;
+}
+
 export interface WorkersPayload {
   workers: WorkerView[];
   counts: WorkerCounts;

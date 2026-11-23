@@ -112,18 +112,18 @@ def test_link_creation_removal_and_directionality() -> None:
 def test_default_topology_has_multihop_and_alternative_paths() -> None:
     topology = build_topology(default_topology_config())
     alpha_paths = topology.find_paths(
-        "sensor-04", "gateway-alpha", max_paths=4
+        "sensor-04", "gateway-01", max_paths=4
     )
-    beta_paths = topology.find_paths("sensor-08", "gateway-beta", max_paths=4)
+    beta_paths = topology.find_paths("sensor-08", "gateway-02", max_paths=4)
     assert len(alpha_paths) >= 2
     assert len(beta_paths) >= 2
     assert any(len(path) > 2 for path in alpha_paths)
     assert any(len(path) > 2 for path in beta_paths)
 
     # The graph is not constrained to a sensor's own gateway cluster.
-    cross_path = topology.shortest_path("sensor-04", "gateway-gamma")
+    cross_path = topology.shortest_path("sensor-04", "gateway-03")
     assert cross_path is not None
-    assert "gateway-gamma" in cross_path
+    assert "gateway-03" in cross_path
 
 
 def test_sensor_readings_are_in_range_smooth_and_labelled_simulated() -> None:
@@ -252,7 +252,7 @@ def test_simulation_config_rejects_invalid_intervals() -> None:
 def test_snapshot_shape_contains_simulation_and_topology() -> None:
     engine = NetworkSimulator()
     snapshot = engine.snapshot()
-    assert set(snapshot) == {"simulation", "topology"}
+    assert {"simulation", "topology", "fl_clients"} <= set(snapshot)
     assert snapshot["simulation"]["note"].startswith("Simulated network only")
     assert snapshot["topology"]["counts"]["sensors"] == 12
     assert snapshot["topology"]["gateway_assignments"]

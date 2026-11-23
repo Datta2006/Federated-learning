@@ -130,6 +130,17 @@ class ProcessRequest(BaseModel):
     name: str
 
 
+class GatewayFlStartRequest(BaseModel):
+    gateway_ids: list[str] | None = None
+    window_hours: int | None = Field(default=None, ge=1)
+    seed: int | None = None
+    gateway_count: int | None = Field(default=None, ge=1)
+
+
+class GatewayFlStopRequest(BaseModel):
+    gateway_ids: list[str] | None = None
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings.load()
     hub = SocketHub()
@@ -518,6 +529,86 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 {"key": key, "label": label} for key, label in ROUND_STAGES
             ],
         }
+
+    @app.get("/api/fl/gateways")
+    def fl_gateways() -> dict[str, Any]:
+        """Gateways as independent FL clients, joined with live MQTT state.
+
+        The simulator owns the private shard/model state; the observer owns the
+        live worker heartbeats and round summaries.  This endpoint only joins
+        the two read-only views and never publishes to the coordinator.
+        """
+        registry = state.registry_snapshot()
+        store_payload = state.store.status_payload(registry)
+        engine_payload = state.simulator.fl_clients_payload()
+        workers = {
+            item.get("worker_id"): item
+            for item in store_payload.get("workers", [])
+            if item.get("worker_id")
+        }
+        summaries = store_payload.get("round_summaries") or []
+        last_summary = summaries[-1] if summaries else None
+        contributions = {
+            item.get("node_id"): item
+            for item in (last_summary or {}).get("contributions", [])
+            if item.get("node_id")
+        }
+        latest = registry.get("latest")
+        gateways: list[dict[str, Any]] = []
+        for client in engine_payload.get("gateways", []):
+            gateway_id = client["gateway_id"]
+            worker_id = client.get("worker_id") or gateway_id
+            worker = workers.get(worker_id)
+            contribution = contributions.get(worker_id)
+            merged = dict(client)
+            merged["worker_id"] = worker_id
+            merged["worker"] = worker
+            merged["online"] = bool(worker and worker.get("online"))
+            merged["live_state"] = (
+                worker.get("state")
+                if worker
+                else client.get("worker_state") or client.get("state")
+            )
+            merged["current_round"] = (
+                worker.get("current_round")
+                if worker and worker.get("current_round") is not None
+                else client.get("current_round")
+            )
+            merged["aggregation_weight"] = (
+                contribution.get("weight") if contribution else None
+            )
+            merged["last_contribution"] = contribution
+            merged["latest_model_version"] = (
+                latest.get("model_version") if latest else None
+            )
+            gateways.append(merged)
+        payload = dict(engine_payload)
+        payload["gateways"] = gateways
+        payload["latest_model"] = latest
+        payload["last_round"] = last_summary
+        payload["round_count"] = registry.get("round_count")
+        return payload
+
+    @app.post("/api/fl/gateways/start")
+    def start_fl_gateways(request: GatewayFlStartRequest | None = None) -> dict[str, Any]:
+        body = request or GatewayFlStartRequest()
+        try:
+            payload = state.simulator.start_fl_clients(
+                gateway_ids=body.gateway_ids,
+                window_hours=body.window_hours,
+                seed=body.seed,
+                gateway_count=body.gateway_count,
+                host=state.settings.broker_host,
+                port=state.settings.broker_port,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, **payload}
+
+    @app.post("/api/fl/gateways/stop")
+    def stop_fl_gateways(request: GatewayFlStopRequest | None = None) -> dict[str, Any]:
+        body = request or GatewayFlStopRequest()
+        return state.simulator.stop_fl_clients(body.gateway_ids)
 
     @app.get("/api/activity")
     def activity(limit: int = Query(default=80, ge=1, le=400)) -> dict[str, Any]:

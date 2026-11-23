@@ -1,9 +1,9 @@
 import { useMemo } from "react";
-import { GitMerge, History, ListTree, Users } from "lucide-react";
+import { GitMerge, History, ListTree, Network, Users } from "lucide-react";
 import { useCommandCenter } from "../hooks/useCommandCenter";
 import { useApi } from "../lib/useApi";
 import { pendingStages } from "../lib/stages";
-import type { RoundsPayload } from "../types";
+import type { GatewayFlPayload, RoundsPayload } from "../types";
 import {
   Badge,
   DataRow,
@@ -21,6 +21,7 @@ import { formatBytes, formatInteger, formatNumber, formatTime, seconds } from ".
 export function FederatedPage() {
   const { status } = useCommandCenter();
   const { data: rounds } = useApi<RoundsPayload>("/api/rounds?limit=60", 5000);
+  const { data: gatewayFl } = useApi<GatewayFlPayload>("/api/fl/gateways", 4000);
   const round = status?.current_round ?? null;
   const session = status?.session_view ?? null;
   const summaries = status?.round_summaries ?? [];
@@ -190,6 +191,117 @@ export function FederatedPage() {
           </Panel>
         </div>
       </div>
+
+      <Panel>
+        <PanelHead
+          title="Federated gateways"
+          subtitle="Each gateway is an independent FL client on a disjoint shard of the historical training years. Weights and validation scalars only; raw rows never leave the gateway."
+          icon={<Network size={14} />}
+          action={
+            <Badge tone={gatewayFl?.available ? "accent" : "neutral"}>
+              {gatewayFl?.count ?? 0} clients
+            </Badge>
+          }
+        />
+        {(gatewayFl?.gateways ?? []).length === 0 ? (
+          <EmptyState
+            title="No gateway FL clients"
+            message="Start them from the simulator API (POST /api/fl/gateways/start). Gateways then register as independent FL workers on their own MQTT connections."
+          />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-[11px]">
+              <thead>
+                <tr className="border-b border-line text-left text-2xs uppercase tracking-wide text-ink-600">
+                  <th className="px-4 py-2 font-medium">Gateway</th>
+                  <th className="px-4 py-2 font-medium">Partition</th>
+                  <th className="px-4 py-2 text-right font-medium">Local samples</th>
+                  <th className="px-4 py-2 text-right font-medium">Val</th>
+                  <th className="px-4 py-2 font-medium">State</th>
+                  <th className="px-4 py-2 text-right font-medium">Round</th>
+                  <th className="px-4 py-2 text-right font-medium">Val loss</th>
+                  <th className="px-4 py-2 text-right font-medium">Agg. weight</th>
+                  <th className="px-4 py-2 font-medium">Model</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(gatewayFl?.gateways ?? []).map((client) => (
+                  <tr
+                    key={client.gateway_id}
+                    className="border-b border-line/60 last:border-0"
+                  >
+                    <td className="mono px-4 py-2 text-ink-200">
+                      <div>{client.gateway_id}</div>
+                      <div className="text-2xs text-ink-600">
+                        {client.worker_id}
+                      </div>
+                    </td>
+                    <td className="px-4 py-2 text-ink-400">
+                      <div>
+                        partition{" "}
+                        {client.gateway_index != null
+                          ? client.gateway_index + 1
+                          : "—"}
+                        /{client.gateway_count ?? "—"}
+                        {client.years.length > 0
+                          ? ` · ${client.years.join(", ")}`
+                          : ""}
+                      </div>
+                      <div className="text-2xs text-ink-600">
+                        shards{" "}
+                        {client.shard_indices.length > 0
+                          ? client.shard_indices.join(", ")
+                          : "—"}{" "}
+                        · {formatInteger(client.source_rows)} rows
+                      </div>
+                    </td>
+                    <td className="mono px-4 py-2 text-right text-ink-300">
+                      {formatInteger(client.n_samples)}
+                      <div className="text-2xs text-ink-600">
+                        {client.storage?.checkpoint_count ?? 0} checkpoints
+                      </div>
+                    </td>
+                    <td className="mono px-4 py-2 text-right text-ink-400">
+                      {formatInteger(client.n_val)}
+                    </td>
+                    <td className="px-4 py-2">
+                      <StatusPill
+                        status={
+                          client.online === false
+                            ? "offline"
+                            : client.live_state ?? client.state
+                        }
+                      />
+                      {client.last_error ? (
+                        <div className="text-2xs text-bad-text">
+                          {client.last_error}
+                        </div>
+                      ) : null}
+                    </td>
+                    <td className="mono px-4 py-2 text-right text-ink-400">
+                      {client.current_round ?? "—"}
+                      <div className="text-2xs text-ink-600">
+                        {client.storage?.rounds_recorded ?? 0} done
+                      </div>
+                    </td>
+                    <td className="mono px-4 py-2 text-right text-ink-300">
+                      {formatNumber(client.last_contribution?.val_loss, 6)}
+                    </td>
+                    <td className="mono px-4 py-2 text-right text-accent-text">
+                      {client.aggregation_weight != null
+                        ? client.aggregation_weight.toFixed(3)
+                        : "—"}
+                    </td>
+                    <td className="mono px-4 py-2 text-ink-500">
+                      {client.latest_model_version ?? "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
 
       <Panel>
         <PanelHead

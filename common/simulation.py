@@ -337,9 +337,185 @@ def prepare_simulation_shards(
     ]
 
 
+def gateway_shard_allocations(
+    config: dict[str, Any],
+    raw: pd.DataFrame,
+    *,
+    gateway_count: int,
+) -> list[list[ShardPlan]]:
+    """Assign every training shard to exactly one gateway.
+
+    The number of shards is ``max(gateway_count, len(training_years))`` so every
+    training year appears even when there are fewer gateways than years.  Shards
+    are then balanced greedily by row count; assignment depends only on the
+    dataset and the gateway count, never on thread scheduling or wall time.
+    """
+    if gateway_count < 1:
+        raise ValueError("gateway_count must be at least 1")
+    years = training_years(config)
+    shard_count = max(int(gateway_count), len(years))
+    plan = build_shard_plan(config, raw, n_workers=shard_count)
+
+    buckets: list[list[ShardPlan]] = [[] for _ in range(gateway_count)]
+    loads = [0] * gateway_count
+    for item in sorted(plan, key=lambda entry: (-entry.train_rows, entry.shard_index)):
+        index = min(range(gateway_count), key=lambda i: (loads[i], i))
+        buckets[index].append(item)
+        loads[index] += item.train_rows
+    for bucket in buckets:
+        bucket.sort(key=lambda entry: entry.shard_index)
+    return buckets
+
+
+def prepare_gateway_partition(
+    raw: pd.DataFrame,
+    config: dict[str, Any],
+    *,
+    gateway_count: int,
+    gateway_index: int,
+    window_hours: int = 24,
+    node_prefix: str = "gw",
+    horizon: int = 1,
+    val_fraction_of_train: float | None = None,
+) -> dict[str, Any]:
+    """Prepare one gateway's disjoint partition, possibly spanning years.
+
+    Each gateway owns one or more whole :class:`ShardPlan` slices.  Prepared
+    windows are concatenated *after* windowing, so no window ever crosses a
+    shard or year boundary.
+    """
+    if gateway_count < 1:
+        raise ValueError("gateway_count must be at least 1")
+    if not 0 <= gateway_index < gateway_count:
+        raise ValueError(
+            f"gateway_index {gateway_index} is outside 0..{gateway_count - 1}"
+        )
+    allocations = gateway_shard_allocations(
+        config, raw, gateway_count=gateway_count
+    )[gateway_index]
+    if not allocations:
+        raise ValueError(f"gateway {gateway_index} received no training shards")
+    shard_count = max(gateway_count, len(training_years(config)))
+    parts = [
+        prepare_simulation_shard(
+            raw,
+            config,
+            n_workers=shard_count,
+            shard_index=item.shard_index,
+            window_hours=window_hours,
+            node_prefix=node_prefix,
+            horizon=horizon,
+            val_fraction_of_train=val_fraction_of_train,
+        )
+        for item in allocations
+    ]
+    prepared = dict(parts[0]["prepared"])
+    for key in (
+        "X_train",
+        "y_train",
+        "X_val",
+        "y_val",
+        "train_timestamps",
+        "val_timestamps",
+    ):
+        if len(parts) > 1:
+            prepared[key] = np.concatenate(
+                [part["prepared"][key] for part in parts], axis=0
+            )
+    years = sorted({int(part["year"]) for part in parts})
+    shard_indices = [int(item.shard_index) for item in allocations]
+    shard_spans = [
+        {
+            "year": int(item.year),
+            "shard_index": int(item.shard_index),
+            "start_row": int(item.start_row),
+            "end_row": int(item.end_row),
+            "train_rows": int(item.train_rows),
+        }
+        for item in allocations
+    ]
+    # When concatenating multi-year partitions, reorganise so all training
+    # windows come before all validation windows (temporal ordering).
+    # Each shard has train at the start and val at the end, so concatenating
+    # directly would interleave training and validation data. We need to
+    # reorder all arrays so train windows are first, then validation windows.
+    # The approach: sort ALL timestamps together and put the first
+    # (1-val_fraction) portion as training, the rest as validation.
+    if len(parts) > 1:
+        # Concatenate all timestamps and arrays
+        all_train_ts = np.concatenate(
+            [part["prepared"]["train_timestamps"] for part in parts]
+        )
+        all_val_ts = np.concatenate(
+            [part["prepared"]["val_timestamps"] for part in parts]
+        )
+        all_X_train = np.concatenate(
+            [part["prepared"]["X_train"] for part in parts], axis=0
+        )
+        all_y_train = np.concatenate(
+            [part["prepared"]["y_train"] for part in parts], axis=0
+        )
+        all_X_val = np.concatenate(
+            [part["prepared"]["X_val"] for part in parts], axis=0
+        )
+        all_y_val = np.concatenate(
+            [part["prepared"]["y_val"] for part in parts], axis=0
+        )
+
+        # Combine all timestamps (train + val) and find the split point
+        all_ts = np.concatenate([all_train_ts, all_val_ts])
+        all_X = np.concatenate([all_X_train, all_X_val], axis=0)
+        all_y = np.concatenate([all_y_train, all_y_val], axis=0)
+        n_train = len(all_train_ts)
+
+        # Sort everything by timestamp
+        sort_idx = np.argsort(all_ts)
+        all_ts_sorted = all_ts[sort_idx]
+        all_X_sorted = all_X[sort_idx]
+        all_y_sorted = all_y[sort_idx]
+
+        # First n_train samples become training, rest become validation
+        # This guarantees max(train_ts) < min(val_ts) if the original data
+        # has temporal ordering within each shard (which it does since shards
+        # are whole years with sorted timestamps)
+        prepared["train_timestamps"] = all_ts_sorted[:n_train]
+        prepared["val_timestamps"] = all_ts_sorted[n_train:]
+        prepared["X_train"] = all_X_sorted[:n_train]
+        prepared["y_train"] = all_y_sorted[:n_train]
+        prepared["X_val"] = all_X_sorted[n_train:]
+        prepared["y_val"] = all_y_sorted[n_train:]
+    worker_id = f"{node_prefix}-{gateway_index + 1}"
+    return {
+        "worker_id": worker_id,
+        "node_id": worker_id,
+        "role": "training",
+        "dataset": "gateway-simulation",
+        "year": years[0],
+        "years": years,
+        "gateway_index": int(gateway_index),
+        "gateway_count": int(gateway_count),
+        "shard_indices": shard_indices,
+        "shard_index": int(gateway_index),
+        "shard_count": int(gateway_count),
+        "n_samples": int(len(prepared["X_train"])),
+        "n_val": int(len(prepared["X_val"])),
+        "source_rows": int(sum(part["prepared"]["source_rows"] for part in parts)),
+        "partition": {
+            "start_row": shard_spans[0]["start_row"],
+            "end_row": shard_spans[-1]["end_row"],
+            "years": years,
+            "shard_indices": shard_indices,
+            "shards": shard_spans,
+        },
+        "prepared": prepared,
+    }
+
+
 __all__ = [
     "ShardPlan",
     "build_shard_plan",
+    "gateway_shard_allocations",
+    "prepare_gateway_partition",
     "prepare_simulation_shard",
     "prepare_simulation_shards",
     "training_years",
