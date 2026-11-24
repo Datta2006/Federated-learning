@@ -11,3 +11,10 @@ dashboard/frontend/dist/
 dashboard/frontend/node_modules/.vite/
 server/model_registry/
 .airfed_runtime/
+
+# Plain CSS frontend (alternative implementation)
+dashboard/frontend-plain/
+
+# Frontend node_modules
+ dashboard/frontend/node_modules/
+ node_modules/

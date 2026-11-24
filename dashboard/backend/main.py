@@ -29,6 +29,7 @@ from simulator.engine import NetworkSimulator
 
 from .air_quality import AirQualityReader
 from .control import ControlError, ControlPublisher
+from .experiment_api import setup_experiment_routes
 from .metrics import build_metrics
 from .mqtt_observer import MQTTObserver, build_observer
 from .process_manager import ProcessError, ProcessManager
@@ -226,10 +227,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["*"],
     )
     app.include_router(create_network_router(state.simulator))
+    setup_experiment_routes(app)
 
     def state_of(app: FastAPI) -> AppState:
         return app.state.airfed
@@ -688,6 +690,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             count=config.simulation_workers,
                             role=config.worker_role,
                             simulation=True,
+                            dummy=config.dummy_workers,
                         )
                     command = "start_session"
                     request_id = uuid.uuid4().hex

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { CheckCircle2, CircleAlert, Loader2, Play, Pause, Square } from "lucide-react";
+import { CheckCircle2, AlertCircle, Loader2, Play, Pause, Square } from "lucide-react";
 import { useAction } from "../hooks/useAction";
 import type { CommandResponse, SessionState } from "../types";
 import { StatusPill } from "./ui";
@@ -16,9 +16,10 @@ export function SessionControl({
   const { run, pending, error, result, resetError } = useAction<CommandResponse>();
   const [rounds, setRounds] = useState(3);
   const [minWorkers, setMinWorkers] = useState(2);
-  const [simWorkers, setSimWorkers] = useState(2);
+  const [simWorkers, setSimWorkers] = useState(3);
   const [deadline, setDeadline] = useState(120);
   const [localEpochs, setLocalEpochs] = useState(1);
+  const [dummyWorkers, setDummyWorkers] = useState(true);
 
   const state = session?.state ?? "idle";
   const active = ACTIVE.has(state);
@@ -44,6 +45,7 @@ export function SessionControl({
               simulation_workers: simWorkers,
               launch_workers: simWorkers > 0,
               worker_role: "training",
+              dummy_workers: dummyWorkers,
             },
           }
         : { action };
@@ -55,7 +57,7 @@ export function SessionControl({
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <StatusPill status={state} pulse={state === "running" || state === "starting"} />
+          <StatusPill status={state} />
           {session?.stale ? (
             <span className="chip border-warn/30 bg-warn-soft text-warn-text">
               state is stale
@@ -111,61 +113,74 @@ export function SessionControl({
       </div>
 
       {!active ? (
-        <div className="grid grid-cols-2 gap-2 rounded border border-line bg-inset p-3 sm:grid-cols-5">
-          <label className="block">
-            <span className="label">Rounds</span>
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 gap-2 rounded border border-line bg-inset p-3 sm:grid-cols-5">
+            <label className="block">
+              <span className="label">Rounds</span>
+              <input
+                className="input mt-1"
+                type="number"
+                min={1}
+                max={50}
+                value={rounds}
+                onChange={(event) => setRounds(Number(event.target.value))}
+              />
+            </label>
+            <label className="block">
+              <span className="label">Min workers</span>
+              <input
+                className="input mt-1"
+                type="number"
+                min={1}
+                max={50}
+                value={minWorkers}
+                onChange={(event) => setMinWorkers(Number(event.target.value))}
+              />
+            </label>
+            <label className="block">
+              <span className="label">Launch sims</span>
+              <input
+                className="input mt-1"
+                type="number"
+                min={0}
+                max={20}
+                value={simWorkers}
+                onChange={(event) => setSimWorkers(Number(event.target.value))}
+              />
+            </label>
+            <label className="block">
+              <span className="label">Local epochs</span>
+              <input
+                className="input mt-1"
+                type="number"
+                min={1}
+                max={10}
+                value={localEpochs}
+                onChange={(event) => setLocalEpochs(Number(event.target.value))}
+              />
+            </label>
+            <label className="block">
+              <span className="label">Deadline (s)</span>
+              <input
+                className="input mt-1"
+                type="number"
+                min={10}
+                max={3600}
+                value={deadline}
+                onChange={(event) => setDeadline(Number(event.target.value))}
+              />
+            </label>
+          </div>
+          <label className="flex items-start gap-2 rounded border border-line bg-inset p-2">
             <input
-              className="input mt-1"
-              type="number"
-              min={1}
-              max={50}
-              value={rounds}
-              onChange={(event) => setRounds(Number(event.target.value))}
+              type="checkbox"
+              checked={dummyWorkers}
+              onChange={(event) => setDummyWorkers(event.target.checked)}
+              className="mt-0.5"
             />
-          </label>
-          <label className="block">
-            <span className="label">Min workers</span>
-            <input
-              className="input mt-1"
-              type="number"
-              min={1}
-              max={50}
-              value={minWorkers}
-              onChange={(event) => setMinWorkers(Number(event.target.value))}
-            />
-          </label>
-          <label className="block">
-            <span className="label">Launch sims</span>
-            <input
-              className="input mt-1"
-              type="number"
-              min={0}
-              max={20}
-              value={simWorkers}
-              onChange={(event) => setSimWorkers(Number(event.target.value))}
-            />
-          </label>
-          <label className="block">
-            <span className="label">Local epochs</span>
-            <input
-              className="input mt-1"
-              type="number"
-              min={1}
-              max={10}
-              value={localEpochs}
-              onChange={(event) => setLocalEpochs(Number(event.target.value))}
-            />
-          </label>
-          <label className="block">
-            <span className="label">Deadline (s)</span>
-            <input
-              className="input mt-1"
-              type="number"
-              min={10}
-              max={3600}
-              value={deadline}
-              onChange={(event) => setDeadline(Number(event.target.value))}
-            />
+            <span className="text-sm">
+              <strong>Demo mode</strong> (dummy weights, no TensorFlow import)
+            </span>
           </label>
         </div>
       ) : null}
@@ -179,7 +194,7 @@ export function SessionControl({
 
       {error ? (
         <div className="flex items-start gap-2 rounded border border-bad/35 bg-bad-soft px-3 py-2 text-[11px] text-bad-text">
-          <CircleAlert size={14} className="mt-0.5 shrink-0" />
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
           <div>
             <div className="font-medium">Command failed</div>
             <div className="mt-0.5 leading-relaxed text-bad-text/80">{error}</div>

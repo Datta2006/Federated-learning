@@ -3,7 +3,24 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AirFed Dashboard</title>
+    <meta name="theme-color" content="#0b63ce" />
+    <meta name="description" content="AirFed federated learning operations dashboard for next-hour PM2.5 forecasting." />
+    <title>AirFed — Operations Console</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      try {
+        var saved = localStorage.getItem("airfed-theme");
+        if (saved === "dark" || saved === "light") {
+          document.documentElement.dataset.theme = saved;
+        }
+      } catch (error) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

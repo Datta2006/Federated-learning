@@ -168,6 +168,7 @@ class TrainingConfig:
     simulation_workers: int = 0
     launch_workers: bool = True
     worker_role: str = "training"
+    dummy_workers: bool = True
 
     @classmethod
     def from_dict(cls, value: dict[str, Any] | None) -> TrainingConfig:
@@ -212,6 +213,7 @@ class TrainingConfig:
         if simulation_workers < 0:
             raise ProtocolError("simulation_workers must be non-negative")
         launch_workers = bool(raw.get("launch_workers", True))
+        dummy_workers = bool(raw.get("dummy_workers", True))
         if mode == "continuous":
             # rounds is ignored for continuous training, but keep a sane value.
             rounds = max(1, rounds)
@@ -230,6 +232,7 @@ class TrainingConfig:
             simulation_workers=simulation_workers,
             launch_workers=launch_workers,
             worker_role=role,
+            dummy_workers=dummy_workers,
         )
 
     def to_dict(self) -> dict[str, Any]:

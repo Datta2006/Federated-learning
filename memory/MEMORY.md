@@ -40,3 +40,6 @@ A professional, responsive React + TypeScript + Vite dashboard called **AirFed**
 - Dark professional theme: deep navy/charcoal background, emerald green for connected nodes and successful aggregation, blue for model communication, red for rejected updates and offline nodes
 - Maintain strict separation between live telemetry and historical replay data
 - All existing tests must continue to pass
+
+## Recent Frontend Fixes
+- [Frontend Demo Ready Status](demo-ready-status.md) — Frontend build passing, ready for testing

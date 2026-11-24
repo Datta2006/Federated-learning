@@ -15,10 +15,9 @@
     "min_clients": 3,
     "rounds": 5,
     "training_nodes": [
-      "node1",
-      "node2",
-      "node3",
-      "node4"
+      "sim-1",
+      "sim-2",
+      "sim-3"
     ]
   },
   "model": {

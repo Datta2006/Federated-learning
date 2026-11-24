@@ -1,7 +1,9 @@
 import { AlertTriangle } from "lucide-react";
 import type { Stage, StageTiming } from "../types";
 
-const statusStyle: Record<string, string> = {
+type StageStatus = 'complete' | 'active' | 'pending' | 'skipped' | 'failed';
+
+const statusStyle: Record<StageStatus, string> = {
   complete: "border-ok/40 bg-ok-soft text-ok-text",
   active: "border-accent/50 bg-accent-soft text-accent-text",
   pending: "border-line2 bg-inset text-ink-500",
@@ -26,10 +28,11 @@ export function StageRail({
     <ol className={`grid gap-1.5 ${dense ? "sm:grid-cols-4" : "sm:grid-cols-2 xl:grid-cols-4"}`}>
       {stages.map((stage, index) => {
         const timing = timings?.[stage.key];
+        const statusKey = stage.status as StageStatus;
         return (
           <li
             key={stage.key}
-            className={`flex items-start gap-2 rounded border px-2.5 py-2 ${statusStyle[stage.status] ?? statusStyle.pending}`}
+            className={`flex items-start gap-2 rounded border px-2.5 py-2 ${statusStyle[statusKey] ?? statusStyle.pending}`}
           >
             <span className="mono mt-0.5 text-2xs opacity-70">
               {String(index + 1).padStart(2, "0")}

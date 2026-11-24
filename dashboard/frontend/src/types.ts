@@ -195,6 +195,7 @@ export interface RoundSummaryView {
   detail: string | null;
   observed_at?: number;
   retained?: boolean;
+  contributions?: Contribution[];
 }
 
 export interface ProcessInfo {

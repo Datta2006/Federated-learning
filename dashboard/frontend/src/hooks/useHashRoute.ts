@@ -14,8 +14,11 @@ export const ROUTES = [
 export type Route = (typeof ROUTES)[number];
 
 function readRoute(): Route {
-  const hash = window.location.hash.replace(/^#\/?/, "").split("?")[0];
-  return (ROUTES as readonly string[]).includes(hash) ? (hash as Route) : "overview";
+  const hash = (window.location.hash || "").replace(/^#\/?/, "").split("?")[0];
+  if (ROUTES.includes(hash as Route)) {
+    return hash as Route;
+  }
+  return "overview";
 }
 
 export function useHashRoute(): [Route, (route: Route) => void] {
