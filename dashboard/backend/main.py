@@ -29,7 +29,7 @@ from simulator.engine import NetworkSimulator
 
 from .air_quality import AirQualityReader
 from .control import ControlError, ControlPublisher
-from .demo_prediction import get_available_models, predict_demo_advanced
+from .demo_prediction import get_available_models, predict_demo_advanced, generate_loss_epochs
 from .experiment_api import setup_experiment_routes
 from .metrics import build_metrics
 from .mqtt_observer import MQTTObserver, build_observer
@@ -415,6 +415,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/api/models/demo/{model_version}/epochs")
+    def get_demo_epochs(
+        model_version: str,
+        epochs: int = Query(default=20, ge=1, le=100),
+    ) -> dict[str, Any]:
+        """Get synthetic loss epoch data for a demo model.
+        
+        This generates mock training data showing loss progression over epochs.
+        Used for visualization in the Testing Model Lab.
+        """
+        from .demo_prediction import generate_loss_epochs
+        epoch_data = generate_loss_epochs(model_version, epochs=epochs)
+        return {
+            "model_version": model_version,
+            "epochs": len(epoch_data),
+            "data": epoch_data,
+            "note": "Synthetic training data for demonstration purposes",
+        }
 
     @app.get("/api/air-quality")
     def air_quality(

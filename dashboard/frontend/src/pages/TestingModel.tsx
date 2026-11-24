@@ -26,6 +26,49 @@ interface ModelsResponse {
   best?: { model_version: string; parameters: number } | null;
 }
 
+// EPA Air Quality Index levels for PM2.5 (µg/m³)
+interface PollutionLevel {
+  level: string;
+  min: number;
+  max: number;
+  color: "ok" | "warn" | "bad";
+  advice: string;
+}
+
+const POLLUTION_LEVELS: PollutionLevel[] = [
+  { level: "Good", min: 0, max: 12, color: "ok", advice: "Air quality is satisfactory, with minimal risk." },
+  { level: "Moderate", min: 12.1, max: 35.4, color: "warn", advice: "Air quality is acceptable, but some pollutants may be a concern for a very small number of sensitive individuals." },
+  { level: "Unhealthy for Sensitive Groups", min: 35.5, max: 55.4, color: "bad", advice: "Members of sensitive groups may experience health effects. The general public is unlikely to be affected." },
+  { level: "Unhealthy", min: 55.5, max: 150.4, color: "bad", advice: "Everyone may begin to experience health effects; members of sensitive groups may experience more serious health effects." },
+  { level: "Very Unhealthy", min: 150.5, max: 250.4, color: "bad", advice: "Health warnings of emergency conditions. The entire population is likely to be affected." },
+  { level: "Hazardous", min: 250.5, max: 500, color: "bad", advice: "Emergency conditions. Everyone is likely to be affected." },
+];
+
+function getPollutionLevel(pm25: number): PollutionLevel {
+  for (const level of POLLUTION_LEVELS) {
+    if (pm25 >= level.min && pm25 <= level.max) {
+      return level;
+    }
+  }
+  // Return last level as default (Hazardous for values > 500)
+  const lastLevel = POLLUTION_LEVELS[POLLUTION_LEVELS.length - 1];
+  return lastLevel ?? { level: "Hazardous", min: 250.5, max: 500, color: "bad", advice: "Emergency conditions. Everyone is likely to be affected." };
+}
+
+// Helper function to get color styles for pollution level
+function getPolutionLevelStyle(color: PollutionLevel["color"]): string {
+  switch (color) {
+    case "ok":
+      return "bg-green-100 dark:bg-green-900/30 border-green-300 dark:border-green-700";
+    case "warn":
+      return "bg-amber-100 dark:bg-amber-900/30 border-amber-300 dark:border-amber-700";
+    case "bad":
+      return "bg-red-100 dark:bg-red-900/30 border-red-300 dark:border-red-700";
+    default:
+      return "bg-muted";
+  }
+}
+
 export function TestingModelPage() {
   const [input, setInput] = useState<number[]>([0.5, 0.3, 0.7, 0.2, 0.9]);
   const [modelVersion, setModelVersion] = useState<string>("");
@@ -334,13 +377,13 @@ export function TestingModelPage() {
         <Panel title="Prediction Results" subtitle={`Model v${modelVersion}`} bodyTight>
           <div className="stat-grid">
             <Stat
-              label="Prediction"
-              value={prediction.predictions.map((p) => p.toFixed(3)).join(", ")}
+              label="PM2.5 Prediction"
+              value={prediction.predictions.map((p) => p.toFixed(1)).join(", ")}
               sub="µg/m³ (particles per cubic meter)"
             />
             <Stat
               label="Confidence"
-              value={prediction.confidence ? `${prediction.confidence}%` : "N/A"}
+              value={prediction.confidence != null ? `${prediction.confidence}%` : "N/A"}
             />
             <Stat
               label="Latency"
@@ -348,6 +391,31 @@ export function TestingModelPage() {
               sub="ms"
             />
           </div>
+
+          {/* Pollution Level Indicator */}
+          {prediction.predictions.length > 0 && (
+            (() => {
+              const pm25Value = prediction.predictions[0];
+              if (pm25Value === undefined) return null;
+              const level = getPollutionLevel(pm25Value);
+              return (
+                <div className={`mt-4 p-3 rounded border ${getPolutionLevelStyle(level.color)}`}>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Badge tone={level.color === "ok" ? "ok" : level.color === "warn" ? "warn" : "bad"}>
+                        {level.level} (PM2.5: {pm25Value.toFixed(1)} µg/m³)
+                      </Badge>
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-2">{level.advice}</p>
+                  <div className="mt-2 text-xs text-muted-foreground">
+                    <span className="font-medium">EPA Scale:</span>{" "}
+                    {level.min === 0 ? "0" : level.min.toFixed(1)} - {level.max.toFixed(1)} µg/m³
+                  </div>
+                </div>
+              );
+            })()
+          )}
 
           <div className="mt-4 p-3 bg-muted rounded">
             <div className="text-sm">
@@ -359,7 +427,7 @@ export function TestingModelPage() {
                 <div>
                   <span className="text-muted-foreground mr-2">Output:</span>
                   <span className="mono">
-                    [{prediction.predictions.map((p) => p.toFixed(3)).join(", ")}]
+                    [{prediction.predictions.map((p) => p.toFixed(1)).join(", ")}]
                   </span>
                 </div>
               </div>

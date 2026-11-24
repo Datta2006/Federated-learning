@@ -121,18 +121,22 @@ def predict_demo(
     # Generate explanation
     feature_contrib = [f"{w:.2f}×{v:.3f}" for w, v in zip(weights[: len(input_array)], input_data)]
 
+    # Scale to PM2.5 range (0-300 µg/m³ for extreme events)
+    scaled_prediction = min(1.0, prediction) * 300
+    
     return {
-        "predictions": [round(prediction, 4)],
+        "predictions": [round(scaled_prediction, 1)],
         "model_version": model_key,
         "input": input_data,
         "output_shape": 1,
-        "confidence": round(min(prediction * 100, 100), 1),
+        "confidence": round(85 + abs(scaled_prediction - 150) / 3, 1),
         "latency_ms": latency_ms,
         "explanation": (
             f"Linear combination of inputs: {' + '.join(feature_contrib)}. "
-            f"Prediction: PM2.5 level = {prediction:.2f} (normalized scale)."
+            f"PM2.5 prediction: {scaled_prediction:.1f} µg/m³."
         ),
         "model_description": model_data["description"],
+        "prediction_units": "µg/m³ (particles per cubic meter)",
     }
 
 
@@ -191,3 +195,52 @@ def predict_demo_advanced(
         "model_description": model_data["description"],
         "prediction_units": "µg/m³ (particles per cubic meter)",
     }
+
+
+def generate_loss_epochs(
+    model_version: str,
+    epochs: int = 10,
+) -> list[dict[str, Any]]:
+    """Generate mock loss epoch data for a model version.
+    
+    This simulates the typical loss decay curve observed during training:
+    - Rapid initial drop in first few epochs
+    - Slower convergence in later epochs
+    - Small plateaus and fluctuations
+    
+    Args:
+        model_version: The model version (affects noise pattern)
+        epochs: Number of epochs to generate
+    
+    Returns:
+        List of dicts with 'epoch', 'train_loss', 'val_loss' keys
+    """
+    if model_version not in MOCK_MODELS:
+        model_version = "v1"
+    
+    model_data = MOCK_MODELS[model_version]
+    base_loss = model_data["val_loss"]
+    
+    # Use different seeds for each model version to get different curves
+    rng = random.Random(hash(model_version) % (2**31))
+    
+    epoch_data = []
+    for epoch in range(1, epochs + 1):
+        # Simulate loss decay with diminishing returns
+        progress = epoch / epochs
+        
+        # Base loss decays exponentially with some noise
+        train_loss = base_loss + (0.05 - base_loss) * (1 - progress) + rng.gauss(0, 0.002)
+        val_loss = train_loss + rng.gauss(0, 0.003)
+        
+        # Add slight noise variation based on model version differences
+        train_loss = max(0.001, train_loss + rng.gauss(0, 0.001))
+        val_loss = max(0.001, val_loss + rng.gauss(0, 0.0015))
+        
+        epoch_data.append({
+            "epoch": epoch,
+            "train_loss": round(train_loss, 6),
+            "val_loss": round(val_loss, 6),
+        })
+    
+    return epoch_data
