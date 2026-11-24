@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "AirFed System Architecture",
+    "quality_profile": "standard"
+  },
+  "components": [
+    { "id": "operator", "type": "external", "label": "Operator", "sublabel": "Browser UI", "pos": [40, 320], "size": [120, 60] },
+    { "id": "frontend", "type": "frontend", "label": "Dashboard Frontend", "sublabel": "React + Vite", "pos": [250, 480], "size": [140, 60] },
+    { "id": "api", "type": "backend", "label": "Dashboard Backend", "sublabel": "FastAPI + WebSocket", "pos": [460, 480], "size": [140, 60] },
+    { "id": "broker", "type": "messagebus", "label": "Mosquitto Broker", "sublabel": "MQTT :1883", "pos": [460, 240], "size": [140, 60] },
+    { "id": "coordinator", "type": "backend", "label": "FL Coordinator", "sublabel": "federated_training.py", "pos": [670, 400], "size": [150, 60] },
+    { "id": "registry", "type": "database", "label": "Model Registry", "sublabel": "latest.json, rounds.csv", "pos": [880, 400], "size": [140, 60] },
+    { "id": "data", "type": "database", "label": "Dataset", "sublabel": "beijing_pm25.csv", "pos": [1080, 400], "size": [140, 60] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Local Development Environment", "wraps": ["operator", "frontend", "api", "broker", "coordinator", "registry", "data"] }
+  ],
+  "connections": [
+    { "id": "http-1", "from": "operator", "to": "frontend", "label": "HTTP" },
+    { "id": "ws-1", "from": "frontend", "to": "api", "label": "REST + WS" },
+    { "id": "mqtt-1", "from": "api", "to": "broker", "label": "subscribe" },
+    { "id": "mqtt-2", "from": "api", "to": "broker", "label": "publish (ctrl)", "variant": "security" },
+    { "id": "mqtt-3", "from": "broker", "to": "coordinator", "label": "commands", "labelDy": 15 },
+    { "id": "coord-reg", "from": "coordinator", "to": "registry", "label": "Write model state", "labelDy": 40 }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Frontend Layer", "items": ["React 18 + TypeScript + Vite", "Hash routing for 9 pages", "Real-time WebSocket to backend", "Plain CSS (no Tailwind, no animations)"] },
+    { "dot": "emerald", "title": "Backend Layer", "items": ["FastAPI REST endpoints", "Paho MQTT observer", "Process manager", "WebSocket telemetry feed"] },
+    { "dot": "amber", "title": "Federated Learning", "items": ["Mosquitto MQTT broker", "Coordinator with retained session state", "Dynamic worker registration", "Round progress via MQTT retained messages"] }
+  ]
+}
