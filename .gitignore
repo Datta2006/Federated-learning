@@ -1,20 +1,46 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# IDE
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing and cache
 .ruff_cache/
+.pytest_cache/
+
+# Experiment and model runs
 .stage4_runs/
 
-# Generated frontend build and live coordinator registry
+# Frontend build artifacts
 dashboard/frontend/dist/
-dashboard/frontend/node_modules/.vite/
+dashboard/frontend/node_modules/
+dashboard/frontend/.vite/
+
+# Server artifacts
 server/model_registry/
+
+# Runtime artifacts
 .airfed_runtime/
 
 # Plain CSS frontend (alternative implementation)
 dashboard/frontend-plain/
 
-# Frontend node_modules
- dashboard/frontend/node_modules/
- node_modules/
+# Root level node_modules
+node_modules/
+
+# Test coverage
+coverage/
+*.log
+
+# Data files (if they're generated)
+# data/
