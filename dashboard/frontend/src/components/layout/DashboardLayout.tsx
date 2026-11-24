@@ -16,6 +16,7 @@ import {
   Terminal,
   Wind,
   X,
+  TestTube2,
 } from "lucide-react";
 import { useCommandCenter } from "../../hooks/useCommandCenter";
 import { relativeTime } from "../../lib/format";
@@ -25,10 +26,11 @@ const routes = [
   { to: "/overview", label: "Overview", icon: LayoutDashboard, description: "System and session state at a glance" },
   { to: "/simulation-lab", label: "Simulation Lab", icon: Activity, description: "Start the network simulator and worker processes" },
   { to: "/network-topology", label: "Network Topology", icon: Network, description: "Gateway and sensor layout from the simulator" },
-  { to: "/terminal", label: "Live Logs", icon: Terminal, description: "Tail coordinator, broker, and worker logs" },
+  { to: "/terminal", label: "Terminal", icon: Terminal, description: "Tail coordinator, broker, and worker logs" },
   { to: "/gateways", label: "Gateways", icon: Server, description: "Federated gateway clients and their shards" },
   { to: "/federated-learning", label: "Federated Learning", icon: Layers, description: "Start a session and follow the current round" },
   { to: "/models", label: "Models", icon: Package, description: "Registered model versions and evaluation" },
+  { to: "/testing-model", label: "Testing Model", icon: TestTube2, description: "Generate random input and test model predictions" },
   { to: "/air-quality", label: "Air Quality", icon: Wind, description: "PM2.5 observations and model predictions" },
   { to: "/experiments", label: "Experiments", icon: List, description: "Recorded experiment runs" },
 ];
@@ -37,10 +39,11 @@ const titles: Record<string, { title: string; sub: string }> = {
   "/overview": { title: "Overview", sub: "Broker, coordinator, workers, and the current federated round." },
   "/simulation-lab": { title: "Simulation Lab", sub: "Run the synthetic field network and launch training workers." },
   "/network-topology": { title: "Network Topology", sub: "Live topology from the network simulator." },
-  "/terminal": { title: "Live Logs", sub: "Read-only process logs. Nothing here is invented." },
+  "/terminal": { title: "Terminal", sub: "Read-only process logs. Nothing here is invented." },
   "/gateways": { title: "Gateways", sub: "Federated gateway clients, partitions, and contributions." },
   "/federated-learning": { title: "Federated Learning", sub: "Control a session and watch round stages progress." },
   "/models": { title: "Models", sub: "The global model registry and offline evaluation results." },
+  "/testing-model": { title: "Testing Model", sub: "Generate random input and test model predictions for demonstration." },
   "/air-quality": { title: "Air Quality", sub: "Historical observations and PM2.5 predictions by node." },
   "/experiments": { title: "Experiments", sub: "Experiment records from the backend database." },
 };

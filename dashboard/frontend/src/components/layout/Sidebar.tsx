@@ -9,6 +9,7 @@ import {
   Layers,
   Cloud,
   History,
+  TestTube2,
 } from 'lucide-react'
 import { useExperimentStore } from '@/stores/experimentStore'
 import { useState, useEffect } from 'react'
@@ -55,6 +56,12 @@ const sidebarRoutes = [
     href: '/models',
     icon: Layers,
     description: 'Global model management',
+  },
+  {
+    name: 'Testing Model',
+    href: '/testing-model',
+    icon: TestTube2,
+    description: 'Model prediction demo and testing',
   },
   {
     name: 'Air Quality',

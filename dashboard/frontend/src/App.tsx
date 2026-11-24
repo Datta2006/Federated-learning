@@ -9,6 +9,7 @@ import { FederatedLearningControlCentrePage } from "@/pages/FederatedLearningCon
 import { ModelCenterPage } from "@/pages/ModelCenter";
 import { AirQualityIntelligencePage } from "@/pages/AirQualityIntelligence";
 import { ExperimentsPage } from "@/pages/Experiments";
+import { TestingModelPage } from "@/pages/TestingModel";
 
 const routes = [
   { path: "/overview", element: <OverviewPage /> },
@@ -18,6 +19,7 @@ const routes = [
   { path: "/gateways", element: <GatewayControlCentrePage /> },
   { path: "/federated-learning", element: <FederatedLearningControlCentrePage /> },
   { path: "/models", element: <ModelCenterPage /> },
+  { path: "/testing-model", element: <TestingModelPage /> },
   { path: "/air-quality", element: <AirQualityIntelligencePage /> },
   { path: "/experiments", element: <ExperimentsPage /> },
 ];

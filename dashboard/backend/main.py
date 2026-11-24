@@ -29,6 +29,7 @@ from simulator.engine import NetworkSimulator
 
 from .air_quality import AirQualityReader
 from .control import ControlError, ControlPublisher
+from .demo_prediction import get_available_models, predict_demo_advanced
 from .experiment_api import setup_experiment_routes
 from .metrics import build_metrics
 from .mqtt_observer import MQTTObserver, build_observer
@@ -379,6 +380,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ),
         }
         return payload
+
+    @app.get("/api/models/demo")
+    def models_demo() -> dict[str, Any]:
+        """Get available demo models for the Testing Model Lab."""
+        versions = get_available_models()
+        return {
+            "available": True,
+            "source": "demo_models",
+            "versions": versions,
+            "note": "Demo models for testing; not trained on real data.",
+        }
+
+    @app.post("/api/predict/demo")
+    def predict_demo(
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run a demo prediction using mock models.
+
+        Request body:
+            model_version: The model version to use
+            input: List of input features (normalized values 0-1)
+        """
+        model_version = request.get("model_version", "v1")
+        input_data = request.get("input", [0.5, 0.5, 0.5])
+
+        if not isinstance(input_data, list) or len(input_data) == 0:
+            raise HTTPException(status_code=400, detail="Invalid input: expected list of numbers")
+
+        try:
+            return predict_demo_advanced(
+                model_version=str(model_version),
+                input_data=[float(v) for v in input_data],
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.get("/api/air-quality")
     def air_quality(
